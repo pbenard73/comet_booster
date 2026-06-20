@@ -124,11 +124,23 @@ export const BONUS_SHIELD_VISUAL_MS  = 9000;   // ms a remote shield ring is sho
 export const BOT_BONUS_SEEK_RANGE    = 1200;   // px — bots steer toward a bonus within this range
 export const BOT_POWERED_SPEED_MULT  = 1.4;    // movement boost while a bonus effect is active
 
-// Bots
-export const BOT_COUNT             = 150;   // number of AI bots spawned in dev (NODE_ENV !== 'production')
+// Bots. Both knobs below are *fallback defaults* — in production they can be
+// overridden by env vars (`BOT_COUNT`, `BOT_DIFFICULTY`); see server/config.ts.
+export const BOT_COUNT             = 150;   // number of AI bots spawned (dev always; prod when BOT_COUNT env > 0)
+
+// Bot difficulty is a level from 1 (weakest) to 100 (deadliest), mapped linearly
+// to a strength multiplier by `botDifficultyMult`: shooting range = BOT_SHOOT_RANGE
+// × mult and fire rate = BOT_SHOOT_COOLDOWN_MS ÷ mult, so level 100 = full strength.
+export const BOT_DIFFICULTY_MIN   = 1;
+export const BOT_DIFFICULTY_MAX   = 100;
+export const BOT_DIFFICULTY_LEVEL = 30;     // default difficulty level (1–100); env override: BOT_DIFFICULTY
+/** Map a 1–100 difficulty level to the 0–1 strength multiplier (clamped). */
+export function botDifficultyMult(level: number): number {
+  const clamped = Math.min(BOT_DIFFICULTY_MAX, Math.max(BOT_DIFFICULTY_MIN, level));
+  return clamped / BOT_DIFFICULTY_MAX;
+}
 
 // Bot shooting
-export const BOT_DIFFICULTY        = 0.3;   // 0 = never shoot  1 = full strength  >1 = harder
-export const BOT_SHOOT_RANGE       = 600;   // world px — max range at difficulty 1
-export const BOT_SHOOT_COOLDOWN_MS = 1500;  // ms between shots at difficulty 1
+export const BOT_SHOOT_RANGE       = 600;   // world px — max range at difficulty level 100
+export const BOT_SHOOT_COOLDOWN_MS = 1500;  // ms between shots at difficulty level 100
 export const BOT_SHOOT_DAMAGE      = 10;    // HP per bot laser hit

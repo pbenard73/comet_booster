@@ -1,7 +1,7 @@
 import type { TemplatedApp } from 'uWebSockets.js';
 import {
   WORLD_WIDTH, WORLD_HEIGHT, BASE_HP, HP_PER_LEVEL, SHIP_COUNT,
-  BOT_DIFFICULTY, BOT_SHOOT_RANGE, BOT_SHOOT_COOLDOWN_MS, LASER_SPEED,
+  botDifficultyMult, BOT_SHOOT_RANGE, BOT_SHOOT_COOLDOWN_MS, LASER_SPEED,
   KNOCKBACK_STUN_MS, KNOCKBACK_SPEED_MULT, KNOCKBACK_SPIN_DEG,
   SERVER_TICK_MS,
   BONUS_INVINCIBLE_MS, BONUS_MEGA_MS, BONUS_MEGA_COOLDOWN_MS,
@@ -104,13 +104,15 @@ export function startBots(
   players: Map<number, ServerPlayer>,
   allocateId: () => number,
   count: number,
+  difficultyLevel: number,   // 1–100; mapped to a strength multiplier
   onBotKilled: (shooterId: number) => void,
   onBotDeath: (x: number, y: number) => void,
 ): BotController {
   const bots: Bot[] = [];
   const botIds          = new Set<number>();
-  const effectiveRange  = BOT_SHOOT_RANGE * BOT_DIFFICULTY;
-  const effectiveCooldown = BOT_DIFFICULTY > 0 ? BOT_SHOOT_COOLDOWN_MS / BOT_DIFFICULTY : Infinity;
+  const difficulty      = botDifficultyMult(difficultyLevel);  // 0–1 strength multiplier
+  const effectiveRange  = BOT_SHOOT_RANGE * difficulty;
+  const effectiveCooldown = difficulty > 0 ? BOT_SHOOT_COOLDOWN_MS / difficulty : Infinity;
   const shootRangeSq    = effectiveRange * effectiveRange;
 
   for (let i = 0; i < count; i++) {
@@ -323,6 +325,6 @@ export function startBots(
     if (p) { p.x = x; p.y = y; }
   }
 
-  console.log(`[AI] ${count} bots running`);
+  console.log(`[AI] ${count} bots running (difficulty level ${difficultyLevel}/100)`);
   return { tick, damageBot, knockBot, applyBonus, teleportBot, isBotId: (id) => botIds.has(id) };
 }

@@ -2,7 +2,7 @@ import uWS, { type WebSocket } from 'uWebSockets.js';
 import {
   PORT, WORLD_WIDTH, WORLD_HEIGHT, SHIP_COUNT,
   LASER_DAMAGE, XP_PER_HIT, XP_PER_KILL, XP_TO_LEVEL,
-  AOI_RADIUS, BOT_COUNT, BOT_SHOOT_DAMAGE, MINIMAP_BOT_REFRESH_MS,
+  AOI_RADIUS, BOT_SHOOT_DAMAGE, MINIMAP_BOT_REFRESH_MS,
   SERVER_TICK_MS, MAX_NEIGHBORS,
   LEADERBOARD_SIZE, LEADERBOARD_REFRESH_MS,
   BONUS_DROP_CHANCE, BONUS_TTL_MS, MAX_BONUSES, TELEPORT_GRID,
@@ -12,6 +12,7 @@ import {
 import { BONUS_KINDS } from '../shared/types.js';
 import type { ServerMessage, ClientMessage, LeaderboardEntry, BonusState, BonusType } from '../shared/types.js';
 import { startBots, type BotController } from './bots.js';
+import { BOT_COUNT_CONFIG, BOT_DIFFICULTY_CONFIG } from './config.js';
 import { SpatialGrid } from './grid.js';
 import { serveStatic } from './static.js';
 import { scoreOf, sanitizeName, type ServerPlayer } from './score.js';
@@ -437,10 +438,15 @@ app.listen(PORT, (token) => {
   if (token) {
     console.log(`Server  →  http://localhost:${PORT}`);
     console.log(`WebSocket  ws://localhost:${PORT}/ws`);
-    if (process.env.NODE_ENV !== 'production') {
-      // Killing a bot earns the shooter (bot or human) kill XP, so bot-vs-bot
-      // fights move the leaderboard the same way human kills do.
-      botCtrl = startBots(app, players, allocateId, BOT_COUNT, (shooterId) => awardXP(shooterId, XP_PER_KILL), maybeDropBonus);
+    // Bots run in dev (always) and in prod when configured. Count + difficulty
+    // come from env vars (BOT_COUNT / BOT_DIFFICULTY) with the shared constants as
+    // fallback; setting BOT_COUNT=0 disables them. Killing a bot earns the shooter
+    // (bot or human) kill XP, so bot-vs-bot fights move the leaderboard like human kills.
+    if (BOT_COUNT_CONFIG > 0) {
+      botCtrl = startBots(
+        app, players, allocateId, BOT_COUNT_CONFIG, BOT_DIFFICULTY_CONFIG,
+        (shooterId) => awardXP(shooterId, XP_PER_KILL), maybeDropBonus,
+      );
     }
 
     // ── Unified authoritative tick (20 Hz, dev + prod) ──────────────────────

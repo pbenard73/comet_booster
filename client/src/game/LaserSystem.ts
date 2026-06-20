@@ -1,11 +1,12 @@
 import Phaser from 'phaser';
 import {
-  LASER_SPEED, LASER_COOLDOWN_MS, LASER_BASE_RANGE, LASER_RANGE_STEP,
+  LASER_SPEED, LASER_COOLDOWN_MS, LASER_BASE_RANGE, LASER_RANGE_STEP, LASER_MAX_RANGE,
   LASER_CONE_LEVEL, LASER_CONE_STEP_DEG, LASER_WING_SPACING,
-  LASER_BASE_CHARGES, LASER_CHARGE_REGEN_MS, LASER_CHARGES_PER_5LV,
+  LASER_BASE_CHARGES, LASER_CHARGE_REGEN_MS, LASER_CHARGES_PER_5LV, LASER_MAX_CHARGES,
   LASER_HIT_FRACTION, BOT_SHOOT_DAMAGE, BONUS_MEGA_COOLDOWN_MS,
   WORLD_WIDTH, WORLD_HEIGHT, inSafeZone,
 } from '@shared/constants';
+import { shipClass, type ShipClassId } from '@shared/classes';
 import { wrap } from './torus';
 import { shipScaleForLevel } from './scale';
 import { showLaserHit, showForceFieldHit } from './effects';
@@ -14,6 +15,7 @@ import type { RemoteShips } from './RemoteShips';
 interface Bolt {
   image: Phaser.GameObjects.Image;
   vx: number; vy: number;
+  speed: number;                  // |velocity| px/s — drives the traveled/range cap
   range: number; traveled: number;
   remote?: true;
   shooterId?: number;
@@ -23,9 +25,11 @@ interface Bolt {
 export interface LaserDeps {
   ship: () => Phaser.Physics.Arcade.Image;
   level: () => number;
+  cls: () => ShipClassId;
   isDead: () => boolean;
   invincibleUntil: () => number;
   remoteShips: RemoteShips;
+  speedMult: () => number;                                    // global game-speed multiplier (scales bolt speed + range)
   onHitRemote: (id: number) => void;                          // landed our bolt on a ship
   hitSelf: (amount: number, shooterId: number | null) => void; // an incoming bolt reached us
   onFire: (bolts: Array<{ x: number; y: number; vx: number; vy: number }>) => void; // broadcast my bolts so others see them
@@ -58,9 +62,12 @@ export class LaserSystem {
   isMega(): boolean { return this.scene.time.now < this.megaUntil; }
   megaRemainingMs(): number { return Math.max(0, this.megaUntil - this.scene.time.now); }
 
-  /** Max charges for the current level — one extra every 5 levels. */
+  /** Max charges for the current level — one extra every 5 levels, capped at
+   *  LASER_MAX_CHARGES (20) regardless of level, plus the class's bonus charges
+   *  (e.g. Engineer's deep magazine) added ON TOP of the cap. */
   maxCharges(): number {
-    return LASER_BASE_CHARGES + Math.floor(this.deps.level() / 5) * LASER_CHARGES_PER_5LV;
+    const byLevel = LASER_BASE_CHARGES + Math.floor(this.deps.level() / 5) * LASER_CHARGES_PER_5LV;
+    return Math.min(byLevel, LASER_MAX_CHARGES) + shipClass(this.deps.cls()).bonusCharges;
   }
 
   getCharges(): number { return this.charges; }
@@ -84,7 +91,8 @@ export class LaserSystem {
     if (!mega && this.charges < 1) return;
     if (!mega) this.charges -= 1;
     this.fire();
-    this.cooldownUntil = time + (mega ? BONUS_MEGA_COOLDOWN_MS : LASER_COOLDOWN_MS);
+    const cooldown = LASER_COOLDOWN_MS * shipClass(this.deps.cls()).fireCooldownMult;
+    this.cooldownUntil = time + (mega ? BONUS_MEGA_COOLDOWN_MS : cooldown);
   }
 
   /** Regenerate the gauge; grant the bonus charge immediately on level-up. */
@@ -92,13 +100,21 @@ export class LaserSystem {
     const max = this.maxCharges();
     if (max > this.prevMax) this.charges += max - this.prevMax;
     this.prevMax = max;
-    this.charges = Math.min(max, this.charges + delta / LASER_CHARGE_REGEN_MS);
+    const regenMs = LASER_CHARGE_REGEN_MS / shipClass(this.deps.cls()).chargeRegenMult;
+    this.charges = Math.min(max, this.charges + delta / regenMs);
   }
 
   private fire(): void {
     const ship   = this.deps.ship();
     const level  = this.deps.level();
-    const range  = LASER_BASE_RANGE + Math.floor(level / 5) * LASER_RANGE_STEP;
+    // Bolt speed and range both scale with the global game speed (same as ships),
+    // so faster games keep shots proportional rather than feeling sluggish.
+    const mult   = this.deps.speedMult();
+    const speed  = LASER_SPEED * mult;
+    // Level grows the base range, but it saturates at LASER_MAX_RANGE (~level 5)
+    // regardless of level; only the global speed and the class rangeMult extend it.
+    const baseRange = Math.min(LASER_BASE_RANGE + Math.floor(level / 5) * LASER_RANGE_STEP, LASER_MAX_RANGE);
+    const range  = baseRange * shipClass(this.deps.cls()).rangeMult * mult;
     const scale  = shipScaleForLevel(level);
     const nose   = 45 * scale;
     const fwdRad = ship.rotation - Math.PI / 2;
@@ -114,8 +130,8 @@ export class LaserSystem {
       const half  = ((count - 1) / 2) * LASER_WING_SPACING;
       const latX  = Math.cos(ship.rotation);
       const latY  = Math.sin(ship.rotation);
-      const vx    = Math.cos(fwdRad) * LASER_SPEED;
-      const vy    = Math.sin(fwdRad) * LASER_SPEED;
+      const vx    = Math.cos(fwdRad) * speed;
+      const vy    = Math.sin(fwdRad) * speed;
       for (let i = 0; i < count; i++) {
         const d = -half + i * LASER_WING_SPACING;
         const bx = noseX + latX * d, by = noseY + latY * d;
@@ -129,7 +145,7 @@ export class LaserSystem {
       for (let i = 0; i < count; i++) {
         const offsetRad = (-half + i * LASER_CONE_STEP_DEG) * (Math.PI / 180);
         const angleRad  = fwdRad + offsetRad;
-        const vx = Math.cos(angleRad) * LASER_SPEED, vy = Math.sin(angleRad) * LASER_SPEED;
+        const vx = Math.cos(angleRad) * speed, vy = Math.sin(angleRad) * speed;
         this.spawnBolt(noseX, noseY, vx, vy, ship.rotation + offsetRad, range);
         fired.push({ x: noseX, y: noseY, vx, vy });
       }
@@ -144,7 +160,8 @@ export class LaserSystem {
     rotation: number, range: number, remote = false, shooterId?: number,
   ): void {
     const image = this.scene.add.image(x, y, 'laser_bolt').setRotation(rotation).setDepth(5);
-    this.bolts.push({ image, vx, vy, range, traveled: 0, ...(remote ? { remote: true as const, shooterId } : {}) });
+    const speed = Math.hypot(vx, vy);   // remote bolts already arrive game-speed-scaled by the shooter
+    this.bolts.push({ image, vx, vy, speed, range, traveled: 0, ...(remote ? { remote: true as const, shooterId } : {}) });
   }
 
   /** Destroy every in-flight bolt (called on death). */
@@ -158,7 +175,7 @@ export class LaserSystem {
     const dt = delta / 1000;
     for (let i = this.bolts.length - 1; i >= 0; i--) {
       const bolt = this.bolts[i];
-      bolt.traveled += LASER_SPEED * dt;
+      bolt.traveled += bolt.speed * dt;
       bolt.image.x  += bolt.vx * dt;
       bolt.image.y  += bolt.vy * dt;
 

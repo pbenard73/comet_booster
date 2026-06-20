@@ -11,8 +11,10 @@ import {
 } from '../shared/constants.js';
 import { BONUS_KINDS } from '../shared/types.js';
 import type { ServerMessage, ClientMessage, LeaderboardEntry, BonusState, BonusType } from '../shared/types.js';
+import { shipClass, SHIP_CLASSES, type ShipClassId } from '../shared/classes.js';
 import { startBots, type BotController } from './bots.js';
-import { BOT_COUNT_CONFIG, BOT_DIFFICULTY_CONFIG } from './config.js';
+import { startBoss, type BossController } from './boss.js';
+import { BOT_COUNT_CONFIG, BOT_DIFFICULTY_CONFIG, GAME_SPEED_CONFIG, BOSS_ENABLED_CONFIG } from './config.js';
 import { SpatialGrid } from './grid.js';
 import { serveStatic } from './static.js';
 import { scoreOf, sanitizeName, type ServerPlayer } from './score.js';
@@ -26,6 +28,7 @@ const sockets  = new Map<number, WebSocket<WsData>>();
 const bonuses  = new Map<number, BonusState>();
 const grid     = new SpatialGrid();
 let botCtrl: BotController | null = null;
+let bossCtrl: BossController | null = null;
 let nextId = 1;
 let nextBonusId = 1;
 let nextTeamId = 1;
@@ -260,9 +263,9 @@ app.ws<WsData>('/ws', {
     sockets.set(id, ws);
 
     const spawn = randomSpawn();
-    players.set(id, { id, ...spawn, angle: 0, dead: false, level: 1, xp: 0, name: `Pilot${id}`, ship: randomShip(), teamId: 0 });
+    players.set(id, { id, ...spawn, angle: 0, dead: false, level: 1, xp: 0, name: `Pilot${id}`, ship: randomShip(), cls: 'normal', teamId: 0 });
 
-    const init: ServerMessage = { type: 'init', id, players: [...players.values()], bonuses: [...bonuses.values()] };
+    const init: ServerMessage = { type: 'init', id, players: [...players.values()], bonuses: [...bonuses.values()], gameSpeed: GAME_SPEED_CONFIG };
     ws.send(JSON.stringify(init));
     sendDirect(id, { type: 'xp_update', xp: 0, xpMax: XP_TO_LEVEL });
 
@@ -302,6 +305,16 @@ app.ws<WsData>('/ws', {
         break;
       }
 
+      case 'set_class': {
+        // Validate against the registry, store it (drives damage scaling here and
+        // the label marker on every client), and broadcast the change.
+        const p = players.get(id);
+        if (!p || !(msg.cls in SHIP_CLASSES)) break;
+        p.cls = msg.cls as ShipClassId;
+        app.publish('all', JSON.stringify({ type: 'player_class', id, cls: p.cls } as ServerMessage));
+        break;
+      }
+
       case 'team_invite_send': {
         // Deliver a confirm prompt to the target's screen. Target must be a live
         // human (not a bot, not self).
@@ -334,10 +347,14 @@ app.ws<WsData>('/ws', {
         // No friendly fire: teammates (same non-zero teamId) can't damage each
         // other, even in the window before a client's team_set arrives.
         if ((shooter.teamId ?? 0) !== 0 && shooter.teamId === target.teamId) break;
-        const hit: ServerMessage = { type: 'player_hit', id: msg.targetId, damage: LASER_DAMAGE, shooterId: id };
+        // Damage is scaled by the shooter's class (Berserker/Sniper hit harder,
+        // Support/Scout softer). Authoritative for both human and bot targets.
+        const damage = Math.max(1, Math.round(LASER_DAMAGE * shipClass(shooter.cls).damageMult));
+        const hit: ServerMessage = { type: 'player_hit', id: msg.targetId, damage, shooterId: id };
         app.publish('all', JSON.stringify(hit));
         awardXP(id, XP_PER_HIT);
-        botCtrl?.damageBot(msg.targetId, LASER_DAMAGE, id);
+        botCtrl?.damageBot(msg.targetId, damage, id);
+        bossCtrl?.damage(msg.targetId, damage, id);   // chip the boss + record the aggressor
         break;
       }
 
@@ -449,6 +466,12 @@ app.listen(PORT, (token) => {
       );
     }
 
+    // The single world boss (server/boss.ts) — one oversized, high-HP enemy that
+    // wanders peacefully until attacked, then hunts its top damage-dealer.
+    if (BOSS_ENABLED_CONFIG) {
+      bossCtrl = startBoss(app, players, allocateId, (shooterId) => awardXP(shooterId, XP_PER_KILL));
+    }
+
     // ── Unified authoritative tick (20 Hz, dev + prod) ──────────────────────
     // The single hot loop: advance bots, then deliver each socket one AoI
     // `bulk_move` built from a spatial grid (O(N + Σ neighbours), not O(N²)),
@@ -459,8 +482,10 @@ app.listen(PORT, (token) => {
       let shots: ReturnType<BotController['tick']> = [];
       if (botCtrl) {
         grid.rebuild(players.values());        // bots aim against current positions
-        shots = botCtrl.tick(now, grid, [...bonuses.values()]);
+        // Bots never target the boss — skip its id when aiming.
+        shots = botCtrl.tick(now, grid, [...bonuses.values()], (oid) => bossCtrl?.isBoss(oid) ?? false);
       }
+      if (bossCtrl) shots = shots.concat(bossCtrl.tick(now));   // boss volleys ride the same laser pass
       grid.rebuild(players.values());          // fresh positions for the broadcast
       botPickups();                            // bots grab any bonus they're touching
 

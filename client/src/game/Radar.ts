@@ -29,6 +29,7 @@ export class Radar {
     shipY: number,
     ships: Iterable<[number, Phaser.GameObjects.Image]>,
     isTeammate: (id: number) => boolean,
+    isBoss: (id: number) => boolean = () => false,
   ): void {
     const R  = MAP_SIZE / 2;
     const cx = this.scene.scale.width  - R - MAP_PAD;
@@ -142,21 +143,28 @@ export class Radar {
     // draw on top. Teammates are bright green and drawn above everyone.
     const frontBlips: Array<[number, number]> = [];
     const teamBlips:  Array<[number, number]> = [];
+    const bossBlips:  Array<[number, number]> = [];   // the boss — always shown, both hemispheres
     g.fillStyle(0x6688aa, 0.40);
     for (const [id, sprite] of ships) {
       if (!sprite.visible) continue;
       const { sx, sy, front: isFront } = projWorld(sprite.x, sprite.y);
-      if (isTeammate(id)) teamBlips.push([sx, sy]);
+      if (isBoss(id))     bossBlips.push([sx, sy]);
+      else if (isTeammate(id)) teamBlips.push([sx, sy]);
       else if (isFront)   frontBlips.push([sx, sy]);
       else                g.fillCircle(sx, sy, 1.4);
     }
 
-    // Silhouette, then front blips, then teammates on top of the wireframe.
+    // Silhouette, then front blips, then teammates, then the boss on top.
     g.lineStyle(1.5, 0x4aa6d0, 0.6).strokeCircle(cx, cy, R);
     g.fillStyle(0xcfe8ff, 0.95);
     for (const [sx, sy] of frontBlips) g.fillCircle(sx, sy, 2.2);
     g.fillStyle(0x33ff66, 1);
     for (const [sx, sy] of teamBlips) g.fillCircle(sx, sy, 3.2);
+    // Boss: a large purple blip, ringed so it stands out even on the back hemisphere.
+    for (const [sx, sy] of bossBlips) {
+      g.fillStyle(0x9b30ff, 1).fillCircle(sx, sy, 4.5);
+      g.lineStyle(1.5, 0xd9a6ff, 0.9).strokeCircle(sx, sy, 5.5);
+    }
 
     // Local player — fixed at the centre.
     g.fillStyle(0xff2222, 1).fillCircle(cx, cy, 3.2);

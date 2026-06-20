@@ -1,6 +1,8 @@
 import Phaser from 'phaser';
 import { MAX_NAME_LEN } from '@shared/constants';
+import type { ShipClassId } from '@shared/classes';
 import { TeamSelect } from '../menu/TeamSelect';
+import { ClassSelect } from '../menu/ClassSelect';
 
 const PSEUDO_KEY = 'comet_pseudo';
 
@@ -9,7 +11,8 @@ export class MenuScene extends Phaser.Scene {
   private cursorOn = true;
   private nameText!: Phaser.GameObjects.Text;
   private teamSelect!: TeamSelect;
-  private choosing = false;   // team modal open → ignore pseudo keystrokes
+  private classSelect!: ClassSelect;
+  private choosing = false;   // a modal is open → ignore pseudo keystrokes
 
   constructor() { super('Menu'); }
 
@@ -70,12 +73,14 @@ export class MenuScene extends Phaser.Scene {
       callback: () => { this.cursorOn = !this.cursorOn; this.renderName(); },
     });
 
-    this.teamSelect = new TeamSelect();
+    this.teamSelect  = new TeamSelect();
+    this.classSelect = new ClassSelect();
 
     this.input.keyboard!.on('keydown', this.onKey, this);
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       this.input.keyboard!.off('keydown', this.onKey, this);
       this.teamSelect.destroy();
+      this.classSelect.destroy();
     });
   }
 
@@ -104,16 +109,18 @@ export class MenuScene extends Phaser.Scene {
     }
   }
 
-  /** ENTER on the callsign → ask whether to join a team, then launch. */
+  /** ENTER on the callsign → pick a class, then a team, then launch. */
   private proceed(): void {
     let name = this.pseudo.trim();
     if (!name) name = 'Pilot' + Math.floor(100 + Math.random() * 900);
     localStorage.setItem(PSEUDO_KEY, name);
 
     this.choosing = true;
-    this.teamSelect.open((inviteTargetId) => {
-      this.choosing = false;
-      this.scene.start('Game', { name, inviteTargetId: inviteTargetId ?? undefined });
+    this.classSelect.open((cls: ShipClassId) => {
+      this.teamSelect.open((inviteTargetId) => {
+        this.choosing = false;
+        this.scene.start('Game', { name, cls, inviteTargetId: inviteTargetId ?? undefined });
+      });
     });
   }
 }

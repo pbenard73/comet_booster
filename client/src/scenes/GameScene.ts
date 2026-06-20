@@ -5,13 +5,15 @@ import {
   PLAYER_SPEED, PLAYER_ROTATION_SPEED, PLAYER_THRUST_SPEED, SEND_RATE_MS,
   SHIP_DRAG, BRAKE_DRAG, inSafeZone,
   BOOST_SPEED_MULT, BOOST_DURATION_MS, BOOST_REGEN_MS, BOOST_MIN_CHARGE,
+  GAME_SPEED_LEVEL, gameSpeedMult,
   COLLISION_RADIUS, BASE_HP, DAMAGE_PER_HIT, DAMAGE_COOLDOWN_MS,
   KNOCKBACK_STUN_MS, KNOCKBACK_SPEED_MULT, KNOCKBACK_SPIN_DEG,
-  BOT_SHOOT_RANGE, XP_TO_LEVEL,
+  LASER_MAX_RANGE, XP_TO_LEVEL,
   BONUS_PICKUP_PAD, BONUS_SIZE_PX, BONUS_INVINCIBLE_MS, BONUS_MEGA_MS,
   BONUS_SHIELD_HITS, BONUS_TELEPORT_INVINCIBLE_MS, BONUS_SHIELD_VISUAL_MS,
 } from '@shared/constants';
 import type { BonusType } from '@shared/types';
+import { shipClass, SUPPORT_HEAL_RANGE, type ShipClassId } from '@shared/classes';
 import { shipKey, ENGINE_OFFSET, INVINCIBLE_MS } from '../game/ui-constants';
 import { shipScaleForLevel, shipSpriteScale, maxHpForLevel } from '../game/scale';
 import { wrap, nearestImage } from '../game/torus';
@@ -48,9 +50,16 @@ export class GameScene extends Phaser.Scene {
   private myNameLabel!: Phaser.GameObjects.Text;
   private shieldAura!:  Phaser.GameObjects.Arc;
   private cursors!:     Phaser.Types.Input.Keyboard.CursorKeys;
+  // WASD (QWERTY) / ZQSD (AZERTY) movement keys, registered alongside the arrows.
+  // Both layouts are covered: up = W|Z, left = A|Q, down = S, right = D.
+  private wasd!:        Record<'W' | 'A' | 'S' | 'D' | 'Z' | 'Q', Phaser.Input.Keyboard.Key>;
   private spaceKey!:    Phaser.Input.Keyboard.Key;
   private shiftKey!:    Phaser.Input.Keyboard.Key;
   private ctrlKey!:     Phaser.Input.Keyboard.Key;
+  // Steering source: 'keys' = LEFT/RIGHT arrows rotate; 'mouse' = ship turns to
+  // face the cursor. Pressing an arrow switches to 'keys'; moving the mouse
+  // switches to 'mouse'. Whichever was used last wins until the other is used.
+  private steerMode: 'keys' | 'mouse' = 'keys';
 
   // Boost gauge: 0..1 charge fraction. Drains while boosting (hold CTRL + thrust),
   // refills otherwise. `boosting` is recomputed each frame for visuals/HUD.
@@ -78,6 +87,10 @@ export class GameScene extends Phaser.Scene {
   private myLevel = 1;
   private myTeamId = 0;
   private myName   = '';
+  private myClass: ShipClassId = 'normal';
+  // Global game-speed multiplier (baseline 1.0); overwritten from the server's
+  // `init` (env GAME_SPEED). Scales movement + rotation on top of class levers.
+  private speedMult = gameSpeedMult(GAME_SPEED_LEVEL);
   // While a team-invite popup is up the invitee is frozen & invincible (cannot
   // play, be hit, or use bonuses) until they answer (10 s timeout).
   private inviteFreeze = false;
@@ -92,8 +105,9 @@ export class GameScene extends Phaser.Scene {
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
-  init(data: { name?: string; inviteTargetId?: number }): void {
+  init(data: { name?: string; cls?: ShipClassId; inviteTargetId?: number }): void {
     this.playerName = (data?.name ?? '').trim();
+    this.myClass    = data?.cls ?? 'normal';
     this.pendingInviteTarget = data?.inviteTargetId ?? null;
   }
 
@@ -108,8 +122,8 @@ export class GameScene extends Phaser.Scene {
     this.myLevel = 1;
     this.myTeamId = 0;
     this.inviteFreeze = false;
-    this.myHp    = BASE_HP;
-    this.myMaxHp = BASE_HP;
+    this.myMaxHp = maxHpForLevel(1, this.myClass);
+    this.myHp    = this.myMaxHp;
     this.myXp    = 0;
     this.myXpMax = XP_TO_LEVEL;
     this.heldBonus  = null;
@@ -131,9 +145,11 @@ export class GameScene extends Phaser.Scene {
     this.lasers      = new LaserSystem(this, {
       ship:            () => this.ship,
       level:           () => this.myLevel,
+      cls:             () => this.myClass,
       isDead:          () => this.isDead,
       invincibleUntil: () => this.invincibleUntil,
       remoteShips:     this.remoteShips,
+      speedMult:       () => this.speedMult,
       onHitRemote:     (id) => this.network.send({ type: 'hit', targetId: id }),
       hitSelf:         (amount, shooterId) => this.applyIncomingLaser(amount, shooterId),
       onFire:          (bolts) => this.network.send({
@@ -191,23 +207,33 @@ export class GameScene extends Phaser.Scene {
       if (this.stunnedUntil > 0 && time >= this.stunnedUntil) this.endStun();
       const stunned = time < this.stunnedUntil;
       if (!stunned) {
-        this.handleInput();
+        this.handleInput(delta);
         if (!this.inSafe) this.checkCollisions(time);
       }
-      this.lasers.shootIfReady(time, this.spaceKey.isDown && !stunned && !this.inSafe);
+      const fireHeld = this.spaceKey.isDown || this.input.activePointer.leftButtonDown();
+      this.lasers.shootIfReady(time, fireHeld && !stunned && !this.inSafe);
       this.checkBonusPickup();
       this.sendPosition(time);
     }
     // Boost gauge: drains over BOOST_DURATION_MS while boosting, else refills
-    // over BOOST_REGEN_MS (regenerates even while dead/stunned).
-    if (this.boosting) this.boostCharge = Math.max(0, this.boostCharge - delta / BOOST_DURATION_MS);
-    else               this.boostCharge = Math.min(1, this.boostCharge + delta / BOOST_REGEN_MS);
+    // over BOOST_REGEN_MS (regenerates even while dead/stunned). The class scales
+    // both: boostDurationMult lengthens a full burst, boostRegenMult speeds refill.
+    const cls = shipClass(this.myClass);
+    if (this.boosting) this.boostCharge = Math.max(0, this.boostCharge - delta / (BOOST_DURATION_MS * cls.boostDurationMult));
+    else               this.boostCharge = Math.min(1, this.boostCharge + delta * cls.boostRegenMult / BOOST_REGEN_MS);
+
+    // Passive HP regen: the class's own regen plus any nearby teammate Support.
+    this.regenHealth(delta);
 
     this.lasers.update(delta);
     this.updateThruster();
     this.updateShieldAura();
     this.updateLabels();
-    this.radar.draw(this.ship.x, this.ship.y, this.remoteShips.entries(), (id) => this.remoteShips.isTeammate(id));
+    this.radar.draw(
+      this.ship.x, this.ship.y, this.remoteShips.entries(),
+      (id) => this.remoteShips.isTeammate(id),
+      (id) => this.remoteShips.isBoss(id),
+    );
 
     this.updateBonusHud();
     this.hud.setPlayers(this.remoteShips.size + 1);
@@ -257,10 +283,13 @@ export class GameScene extends Phaser.Scene {
 
   private bindKeys(): void {
     this.cursors  = this.input.keyboard!.createCursorKeys();
+    this.wasd     = this.input.keyboard!.addKeys('W,A,S,D,Z,Q') as typeof this.wasd;
     this.spaceKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
     this.shiftKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.SHIFT);
     this.ctrlKey  = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.CTRL);
     this.shiftKey.on('down', () => this.activateHeldBonus());
+    // Moving the mouse hands steering to the cursor (until an arrow is pressed).
+    this.input.on('pointermove', () => { this.steerMode = 'mouse'; });
     this.input.keyboard!.once('keydown-ESC', () => {
       this.network.disconnect();
       this.scene.start('Menu');
@@ -281,8 +310,10 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.network
-      .on('init', ({ id, players, bonuses }) => {
+      .on('init', ({ id, players, bonuses, gameSpeed }) => {
         this.myId = id;
+        this.speedMult = gameSpeedMult(gameSpeed);
+        this.ship.setMaxVelocity(PLAYER_SPEED * this.speedMult);
         const me = players.find(p => p.id === id);
         if (me) {
           this.ship.setTexture(shipKey(me.ship)).setPosition(me.x, me.y);
@@ -293,6 +324,8 @@ export class GameScene extends Phaser.Scene {
         players.forEach(p => { if (p.id !== id) this.remoteShips.spawn(p); });
         bonuses.forEach(b => this.bonuses.spawn(b));
         if (this.playerName) this.network.send({ type: 'set_name', name: this.playerName });
+        // Tell the server our chosen class (default 'normal' needs no announce).
+        if (this.myClass !== 'normal') this.network.send({ type: 'set_class', cls: this.myClass });
         // Fire the team invite chosen on the start screen (target confirms in-game).
         if (this.pendingInviteTarget !== null && this.pendingInviteTarget !== id) {
           this.network.send({ type: 'team_invite_send', toId: this.pendingInviteTarget });
@@ -327,11 +360,17 @@ export class GameScene extends Phaser.Scene {
       .on('laser_spawn', ({ shooterId, x, y, vx, vy }) => {
         if (shooterId === this.myId) return; // already rendered locally
         const rotation = Math.atan2(vy, vx) + Math.PI / 2;
+        // Bots & remote players are capped at LASER_MAX_RANGE (like the local
+        // player); the boss is exempt — it uses its profile's (much longer)
+        // shootRange so its volleys actually reach distant targets.
+        const baseRange = this.remoteShips.bossShootRangeOf(shooterId) ?? LASER_MAX_RANGE;
         // Spawn in our continuous frame so it appears next to the firing ship.
         this.lasers.spawnBolt(
           nearestImage(x, this.ship.x, WORLD_WIDTH),
           nearestImage(y, this.ship.y, WORLD_HEIGHT),
-          vx, vy, rotation, BOT_SHOOT_RANGE, true, shooterId,
+          // Bolt velocity already arrives game-speed-scaled by the shooter; scale
+          // the range cap too so it travels proportionally farther (not longer-lived).
+          vx, vy, rotation, baseRange * this.speedMult, true, shooterId,
         );
       })
       .on('bonus_spawn', ({ bonus }) => {
@@ -379,7 +418,7 @@ export class GameScene extends Phaser.Scene {
           this.cameras.main.centerOn(x, y);
           this.cameras.main.flash(400, 0, 180, 80);
           this.myLevel       = level;
-          this.myMaxHp       = maxHpForLevel(level);
+          this.myMaxHp       = maxHpForLevel(level, this.myClass);
           this.myHp          = this.myMaxHp;
           this.myXp          = 0;
           this.lastDamagedBy = null;
@@ -416,7 +455,7 @@ export class GameScene extends Phaser.Scene {
       .on('player_level_up', ({ id, level }) => {
         if (id === this.myId) {
           this.myLevel = level;
-          this.myMaxHp = maxHpForLevel(level);
+          this.myMaxHp = maxHpForLevel(level, this.myClass);
           this.myHp    = this.myMaxHp;
           this.applyShipScale();
           showLevelUpEffect(this, level);
@@ -427,6 +466,10 @@ export class GameScene extends Phaser.Scene {
       .on('player_rename', ({ id, name }) => {
         if (id === this.myId) { this.myName = name; this.applyMyLabelStyle(); }
         else this.remoteShips.rename(id, name);
+      })
+      .on('player_class', ({ id, cls }) => {
+        // A remote ship picked/changed its class → restyle its label + HP.
+        if (id !== this.myId) this.remoteShips.setClass(id, cls);
       })
       .on('team_set', ({ updates }) => {
         for (const u of updates) {
@@ -454,31 +497,67 @@ export class GameScene extends Phaser.Scene {
 
   // ── Gameplay ───────────────────────────────────────────────────────────────
 
-  private handleInput(): void {
-    const { left, right, up, down } = this.cursors;
-    if (left.isDown)       this.ship.setAngularVelocity(-PLAYER_ROTATION_SPEED);
-    else if (right.isDown) this.ship.setAngularVelocity(PLAYER_ROTATION_SPEED);
-    else                   this.ship.setAngularVelocity(0);
+  /** Combined directional input: arrow keys OR WASD (QWERTY) / ZQSD (AZERTY). */
+  private moveInput() {
+    const c = this.cursors, k = this.wasd;
+    return {
+      up:    c.up.isDown    || k.W.isDown || k.Z.isDown,
+      down:  c.down.isDown  || k.S.isDown,
+      left:  c.left.isDown  || k.A.isDown || k.Q.isDown,
+      right: c.right.isDown || k.D.isDown,
+    };
+  }
+
+  private handleInput(delta: number): void {
+    const { left, right, up, down } = this.moveInput();
+    const cls    = shipClass(this.myClass);
+    const rotate = PLAYER_ROTATION_SPEED * cls.rotationMult * this.speedMult; // class manoeuvrability × game speed
+
+    // Pressing a turn key takes steering back from the mouse.
+    if (left || right) this.steerMode = 'keys';
+
+    if (this.steerMode === 'mouse') {
+      // Turn toward the cursor at the same rotation speed as the arrows (no snap).
+      const ptr = this.input.activePointer;
+      // Ship image points up at rotation 0, so its facing = atan2(dy,dx) + π/2.
+      const target  = Math.atan2(ptr.worldY - this.ship.y, ptr.worldX - this.ship.x) + Math.PI / 2;
+      const diff    = Phaser.Math.Angle.Wrap(target - this.ship.rotation);
+      const maxStep = Phaser.Math.DegToRad(rotate) * delta / 1000;
+      if (Math.abs(diff) <= maxStep) {
+        this.ship.setAngularVelocity(0).setRotation(target);
+      } else {
+        this.ship.setAngularVelocity(diff > 0 ? rotate : -rotate);
+      }
+    } else if (left)  this.ship.setAngularVelocity(-rotate);
+    else if (right)   this.ship.setAngularVelocity(rotate);
+    else              this.ship.setAngularVelocity(0);
 
     // Brake: holding DOWN (without thrusting) swaps in a much stronger damping so
     // the ship decelerates to a stop. Otherwise coast on the gentle default drag.
-    this.ship.setDrag(down.isDown && !up.isDown ? BRAKE_DRAG : SHIP_DRAG);
+    this.ship.setDrag(down && !up ? BRAKE_DRAG : SHIP_DRAG);
 
     // Boost: hold CTRL while thrusting to fly at BOOST_SPEED_MULT× thrust speed
     // until the gauge runs dry. Lift the velocity cap so the burst isn't clamped.
     // A new burst can only start once the gauge has refilled to BOOST_MIN_CHARGE,
     // but an in-progress burst (boostEngaged) keeps draining down to empty.
-    const wantBoost = this.ctrlKey.isDown && up.isDown && this.boostCharge > 0;
+    const wantBoost = this.ctrlKey.isDown && up && this.boostCharge > 0;
     this.boostEngaged = wantBoost && (this.boostEngaged || this.boostCharge >= BOOST_MIN_CHARGE);
     this.boosting = this.boostEngaged;
-    const speed = this.boosting ? PLAYER_THRUST_SPEED * BOOST_SPEED_MULT : PLAYER_THRUST_SPEED;
-    this.ship.setMaxVelocity(this.boosting ? PLAYER_THRUST_SPEED * BOOST_SPEED_MULT : PLAYER_SPEED);
+    const boostSpeed = PLAYER_THRUST_SPEED * BOOST_SPEED_MULT * cls.boostSpeedMult * this.speedMult;
+    const speed = this.boosting ? boostSpeed : PLAYER_THRUST_SPEED * this.speedMult;
+    this.ship.setMaxVelocity(this.boosting ? boostSpeed : PLAYER_SPEED * this.speedMult);
 
-    if (up.isDown) {
-      this.physics.velocityFromRotation(this.ship.rotation - Math.PI / 2, speed, this.ship.body!.velocity);
-    } else {
-      this.ship.setAcceleration(0);
+    // Keep momentum aligned with the ship's heading so turning also steers the
+    // velocity vector (arcade feel: you always move where you point). While
+    // thrusting, magnitude = thrust/boost speed; while coasting/braking we keep
+    // the current speed and just re-point it. The knockback launch is exempt
+    // because handleInput is skipped during the post-collision stun.
+    const vel = this.ship.body!.velocity;
+    const mag = up ? speed : vel.length();
+    if (up || mag > 0) {
+      this.physics.velocityFromRotation(this.ship.rotation - Math.PI / 2, mag, vel);
     }
+    if (!up) this.ship.setAcceleration(0);
   }
 
   private checkCollisions(time: number): void {
@@ -490,7 +569,7 @@ export class GameScene extends Phaser.Scene {
       if (!sprite.visible) continue;
       // A ship sheltering in a refuge can't be rammed.
       if (inSafeZone(wrap(sprite.x, WORLD_WIDTH), wrap(sprite.y, WORLD_HEIGHT))) continue;
-      const theirRadius = COLLISION_RADIUS * shipScaleForLevel(this.remoteShips.levelOf(id));
+      const theirRadius = COLLISION_RADIUS * this.remoteShips.collisionScaleOf(id);
       if (Phaser.Math.Distance.Between(this.ship.x, this.ship.y, sprite.x, sprite.y) < myRadius + theirRadius) {
         this.applyKnockback(sprite.x, sprite.y, time);
         // Bounce the other ship too: humans bounce themselves (their client
@@ -525,7 +604,7 @@ export class GameScene extends Phaser.Scene {
    *  spinning, and lock out control for KNOCKBACK_STUN_MS. */
   private applyKnockback(fromX: number, fromY: number, time: number): void {
     const away  = Math.atan2(this.ship.y - fromY, this.ship.x - fromX);
-    const speed = KNOCKBACK_SPEED_MULT * PLAYER_SPEED;
+    const speed = KNOCKBACK_SPEED_MULT * PLAYER_SPEED * this.speedMult;
     this.ship.setDrag(SHIP_DRAG);      // clear any brake drag so the launch decays normally
     this.ship.setMaxVelocity(speed);   // lift the normal cap so the launch isn't clamped
     this.physics.velocityFromRotation(away, speed, this.ship.body!.velocity);
@@ -543,7 +622,7 @@ export class GameScene extends Phaser.Scene {
   private endStun(): void {
     this.stunnedUntil = 0;
     this.ship.setAngularVelocity(0);
-    this.ship.setMaxVelocity(PLAYER_SPEED);
+    this.ship.setMaxVelocity(PLAYER_SPEED * this.speedMult);
   }
 
   /** Incoming bot laser confirmed contact (LaserSystem already checked guards). */
@@ -574,7 +653,7 @@ export class GameScene extends Phaser.Scene {
   }
 
   private updateThruster(): void {
-    const isThrusting = !this.isDead && !this.inviteFreeze && this.time.now >= this.stunnedUntil && this.cursors.up.isDown;
+    const isThrusting = !this.isDead && !this.inviteFreeze && this.time.now >= this.stunnedUntil && this.moveInput().up;
     this.thruster.setVisible(isThrusting);
     if (!isThrusting) return;
     const s         = shipScaleForLevel(this.myLevel);
@@ -591,12 +670,34 @@ export class GameScene extends Phaser.Scene {
     this.thruster.setScale(0.55 * shipScaleForLevel(this.myLevel));
   }
 
-  /** Teammates show their pseudo in green wrapped in stars (matches RemoteShips). */
+  /** Label = class marker + pseudo. Teammates override to green-with-stars; solo
+   *  players show their class colour (or the default gold for 'normal'). Mirrors
+   *  RemoteShips.applyLabelStyle. */
   private applyMyLabelStyle(): void {
     const teamed = this.myTeamId !== 0;
+    const cls    = shipClass(this.myClass);
+    const marked = cls.marker ? `${cls.marker} ${this.myName}` : this.myName;
     this.myNameLabel
-      .setText(teamed ? `⭐ ${this.myName} ⭐` : this.myName)
-      .setColor(teamed ? '#33ff66' : '#ffee88');
+      .setText(teamed ? `⭐ ${marked} ⭐` : marked)
+      .setColor(teamed ? '#33ff66' : cls.id !== 'normal' ? cls.color : '#ffee88');
+  }
+
+  /** Passive HP regen: the class's own `regenPerSec` plus the sum of every nearby
+   *  teammate Support's `teamHealPerSec`. Client-side (human HP isn't server-tracked). */
+  private regenHealth(delta: number): void {
+    if (this.isDead || this.myHp >= this.myMaxHp) return;
+    let perSec = shipClass(this.myClass).regenPerSec;
+    if (this.myTeamId !== 0) {
+      const rangeSq = SUPPORT_HEAL_RANGE * SUPPORT_HEAL_RANGE;
+      for (const [id, sprite] of this.remoteShips.entries()) {
+        if (!sprite.visible || !this.remoteShips.isTeammate(id)) continue;
+        const heal = shipClass(this.remoteShips.classOf(id)).teamHealPerSec;
+        if (heal <= 0) continue;
+        const dx = sprite.x - this.ship.x, dy = sprite.y - this.ship.y;
+        if (dx * dx + dy * dy <= rangeSq) perSec += heal;
+      }
+    }
+    if (perSec > 0) this.myHp = Math.min(this.myMaxHp, this.myHp + perSec * delta / 1000);
   }
 
   /** A team invite arrived: freeze the ship and make it invincible while deciding. */

@@ -4,6 +4,7 @@
 // `BOT_COUNT=500 BOT_DIFFICULTY=80 npm start`).
 import {
   BOT_COUNT, BOT_DIFFICULTY_LEVEL, BOT_DIFFICULTY_MIN, BOT_DIFFICULTY_MAX,
+  GAME_SPEED_LEVEL, GAME_SPEED_MIN, GAME_SPEED_MAX, BOSS_ENABLED,
 } from '../shared/constants.js';
 
 /** Read an integer env var, clamped to [min, max]; fall back to `def` if unset/blank/non-numeric. */
@@ -25,3 +26,12 @@ export const BOT_COUNT_CONFIG = envInt('BOT_COUNT', BOT_COUNT, 0, 100_000);
 export const BOT_DIFFICULTY_CONFIG = envInt(
   'BOT_DIFFICULTY', BOT_DIFFICULTY_LEVEL, BOT_DIFFICULTY_MIN, BOT_DIFFICULTY_MAX,
 );
+
+/** Global game-speed level 0–100 (env: GAME_SPEED); scales movement + rotation for
+ *  bots (here) and humans (sent to clients in `init`). */
+export const GAME_SPEED_CONFIG = envInt(
+  'GAME_SPEED', GAME_SPEED_LEVEL, GAME_SPEED_MIN, GAME_SPEED_MAX,
+);
+
+/** Whether the single world boss spawns (env: BOSS_ENABLED=1/0; default from constants). */
+export const BOSS_ENABLED_CONFIG = envInt('BOSS_ENABLED', BOSS_ENABLED ? 1 : 0, 0, 1) === 1;

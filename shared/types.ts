@@ -1,3 +1,5 @@
+import type { ShipClassId } from './classes.js';
+
 export interface PlayerState {
   id:     number;
   x:      number;
@@ -7,8 +9,10 @@ export interface PlayerState {
   level:  number;
   ship:   number;   // index into the ship sprite pool (assigned by server, stable per player)
   name:   string;   // pseudo shown above the ship
+  cls?:   ShipClassId;  // chosen RPG class (default 'normal'); drives stats + label marker
   teamId?: number;  // 0/undefined = no team; shared by all members of a connected team (see server mergeTeams)
   bot?:   boolean;  // true for AI bots (dev only) — humans omit it. Lets clients suppress human-laser visuals.
+  boss?:  string;   // boss profile id (shared/bosses.ts) when this is a boss bot; drives 3× size + purple radar blip + huge HP
 }
 
 // Power-up bonuses dropped by exploding ships. The kinds map 1:1 to the icons in
@@ -26,13 +30,14 @@ export interface BonusState {
 
 // Messages sent by the server → client
 export type ServerMessage =
-  | { type: 'init';            id: number; players: PlayerState[]; bonuses: BonusState[] }
+  | { type: 'init';            id: number; players: PlayerState[]; bonuses: BonusState[]; gameSpeed: number }
   | { type: 'player_join';     player: PlayerState }
   | { type: 'player_move';     id: number; x: number; y: number; angle: number }
   | { type: 'player_die';      id: number }
   | { type: 'player_respawn';  id: number; x: number; y: number; level: number }
   | { type: 'player_leave';    id: number }
   | { type: 'player_rename';   id: number; name: string }
+  | { type: 'player_class';    id: number; cls: ShipClassId }   // a player picked/changed their class
   | { type: 'player_level_up'; id: number; level: number }
   | { type: 'player_hit';      id: number; damage: number; shooterId: number }
   | { type: 'xp_update';       xp: number; xpMax: number }
@@ -66,4 +71,5 @@ export type ClientMessage =
   | { type: 'notify_effect'; kind: BonusType; ms: number }  // I activated a bonus → broadcast it so others see it
   | { type: 'team_invite_send';    toId: number }           // invite a player to team up (sent on spawn from the menu choice)
   | { type: 'team_invite_respond'; fromId: number; accept: boolean }  // answer an invite
+  | { type: 'set_class'; cls: ShipClassId }                 // pick a ship class (sent on spawn from the menu)
   | { type: 'set_name'; name: string };

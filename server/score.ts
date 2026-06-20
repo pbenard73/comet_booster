@@ -1,7 +1,9 @@
 import { XP_TO_LEVEL, MAX_NAME_LEN } from '../shared/constants.js';
 import type { PlayerState } from '../shared/types.js';
 
-export type ServerPlayer = PlayerState & { dead: boolean; xp: number; name: string };
+import type { ShipClassId } from '../shared/classes.js';
+
+export type ServerPlayer = PlayerState & { dead: boolean; xp: number; name: string; cls: ShipClassId };
 
 /** Total "points" used for ranking — accumulated level progression. */
 export function scoreOf(p: ServerPlayer): number {

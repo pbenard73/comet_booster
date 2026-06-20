@@ -3,6 +3,21 @@ export const WORLD_HEIGHT          = 10_000;
 export const PLAYER_SPEED          = 500;
 export const PLAYER_ROTATION_SPEED = 200;
 export const PLAYER_THRUST_SPEED   = 200;  // px/s — normal forward thrust speed
+
+// Global game speed — a level 0–100 that scales how fast every ship moves AND
+// turns (players and bots alike), on top of any per-class rotation/boost levers.
+// The baseline level GAME_SPEED_LEVEL maps to multiplier 1.0 (the current tuning),
+// so gameSpeedMult(level) = level / GAME_SPEED_LEVEL: 80 → 2× faster, 20 → 2× slower.
+// Env override: GAME_SPEED (see server/config.ts). The resolved level is sent to
+// clients in the `init` message so player movement is tunable without a rebuild.
+export const GAME_SPEED_MIN   = 0;
+export const GAME_SPEED_MAX   = 100;
+export const GAME_SPEED_LEVEL = 40;   // default/baseline level (0–100); env override: GAME_SPEED
+/** Map a 0–100 game-speed level to a movement/rotation multiplier (baseline → 1.0). */
+export function gameSpeedMult(level: number): number {
+  const clamped = Math.min(GAME_SPEED_MAX, Math.max(GAME_SPEED_MIN, level));
+  return clamped / GAME_SPEED_LEVEL;
+}
 export const SHIP_DRAG              = 0.98; // damping multiplier/s while coasting (gentle drift)
 export const BRAKE_DRAG             = 0.1;  // damping multiplier/s while braking (DOWN arrow) — ~stops in ~2 s
 
@@ -50,6 +65,11 @@ export const LASER_SPEED        = 600;   // px/s
 export const LASER_COOLDOWN_MS  = 350;   // ms between volleys
 export const LASER_BASE_RANGE   = 400;   // px at level 1
 export const LASER_RANGE_STEP   = 100;   // px added every 5 levels
+// Hard cap on how far a bolt travels, BEFORE the global speed level and the
+// class rangeMult scale it. Applies to players AND bots (a bot's remote bolt is
+// capped at spawn); the boss is exempt (it uses its profile's shootRange). So the
+// level-based range growth saturates at level 5 — only game speed / class extend it.
+export const LASER_MAX_RANGE    = 500;   // px — level-based range cap (≈ level 5)
 export const LASER_CONE_LEVEL   = 25;    // level where cone mode activates
 export const LASER_CONE_STEP_DEG = 3;    // degrees between adjacent cone lasers
 export const LASER_WING_SPACING  = 15;   // px between parallel lasers
@@ -60,6 +80,10 @@ export const LASER_HIT_FRACTION  = 0.75; // bolt hits within 75% of the sprite h
 export const LASER_BASE_CHARGES   = 5;     // charges at level 1 (full gauge)
 export const LASER_CHARGE_REGEN_MS = 2000; // ms to regenerate one charge
 export const LASER_CHARGES_PER_5LV = 1;    // extra max charge gained every 5 levels
+// Hard cap on the level-based ammo gauge. The gauge starts at 5 and grows +1 per
+// 5 levels as before, but saturates here regardless of level; a class's
+// bonusCharges is added ON TOP (so only a class can exceed the cap).
+export const LASER_MAX_CHARGES     = 20;   // max level-based charges (≈ level 75)
 
 // XP / level gauge
 export const XP_PER_HIT   = 1;    // XP awarded for landing a laser
@@ -107,7 +131,7 @@ export const LEADERBOARD_REFRESH_MS = 1000;  // ms — server recomputes & broad
 export const MAX_NAME_LEN           = 14;    // max characters in a player pseudo
 
 // Bonuses (power-ups dropped by exploding ships)
-export const BONUS_DROP_CHANCE       = 0.5;    // probability an exploding ship drops a bonus
+export const BONUS_DROP_CHANCE       = 1.0;    // probability an exploding ship drops a bonus (maxed: every kill drops)
 export const BONUS_SIZE_PX           = 75;     // on-screen sprite size (px)
 export const BONUS_PICKUP_PAD        = 18;     // extra px added to the ship radius for pickup overlap
 export const BONUS_TTL_MS            = 20000;  // ms a dropped bonus lingers before despawning
@@ -143,4 +167,10 @@ export function botDifficultyMult(level: number): number {
 // Bot shooting
 export const BOT_SHOOT_RANGE       = 600;   // world px — max range at difficulty level 100
 export const BOT_SHOOT_COOLDOWN_MS = 1500;  // ms between shots at difficulty level 100
-export const BOT_SHOOT_DAMAGE      = 10;    // HP per bot laser hit
+export const BOT_SHOOT_DAMAGE      = 10;    // HP per bot laser hit (also used for boss bolts)
+
+// Boss bots (server/boss.ts, profiles in shared/bosses.ts). Only one boss exists
+// at a time. Enabled by default; env override BOSS_ENABLED (1/0), see server/config.ts.
+export const BOSS_ENABLED      = true;
+export const BOSS_RESPAWN_MS   = 30_000;  // ms after a boss dies before a fresh one spawns
+export const BOSS_DPS_WINDOW_MS = 10_000; // sliding window for "top damage-dealer" targeting

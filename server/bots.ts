@@ -3,19 +3,26 @@ import {
   WORLD_WIDTH, WORLD_HEIGHT, BASE_HP, HP_PER_LEVEL, SHIP_COUNT,
   botDifficultyMult, BOT_SHOOT_RANGE, BOT_SHOOT_COOLDOWN_MS, LASER_SPEED,
   KNOCKBACK_STUN_MS, KNOCKBACK_SPEED_MULT, KNOCKBACK_SPIN_DEG,
-  SERVER_TICK_MS,
+  SERVER_TICK_MS, gameSpeedMult,
   BONUS_INVINCIBLE_MS, BONUS_MEGA_MS, BONUS_MEGA_COOLDOWN_MS,
   BONUS_SHIELD_HITS, BONUS_TELEPORT_INVINCIBLE_MS,
   BOT_BONUS_SEEK_RANGE, BOT_POWERED_SPEED_MULT,
 } from '../shared/constants.js';
 import type { SpatialGrid } from './grid.js';
+import { shipClass, SHIP_CLASS_ORDER, type ShipClassId } from '../shared/classes.js';
 
-/** HP scales with level, matching the client's max-HP formula (for the HP bar). */
-const maxHpForLevel = (level: number) => BASE_HP + (level - 1) * HP_PER_LEVEL;
+/** HP scales with level & class, matching the client's max-HP formula (for the HP bar). */
+const maxHpForLevel = (level: number, cls: ShipClassId) =>
+  Math.round((BASE_HP + (level - 1) * HP_PER_LEVEL) * shipClass(cls).maxHpMult);
 import type { ServerMessage, BonusType } from '../shared/types.js';
 import type { ServerPlayer } from './score.js';
+import { GAME_SPEED_CONFIG } from './config.js';
 
 const BOT_SPEED  = 200;  // px/s max
+// Global game-speed multiplier (env GAME_SPEED, baseline 40 → 1.0): scales both
+// bot translation speed and turn rate so humans and bots share one speed knob.
+const GAME_SPEED = gameSpeedMult(GAME_SPEED_CONFIG);
+const BOT_TURN_STEP = 3 * GAME_SPEED;  // max deg/tick the bot rotates toward its target
 const RESPAWN_MS = 3000;
 const SHOOT_CONE_DEG = 18;                                  // only fire when target is this close to dead-ahead
 const COS_SHOOT_CONE = Math.cos(SHOOT_CONE_DEG * Math.PI / 180);
@@ -29,6 +36,7 @@ interface Bot {
   id:       number;
   name:     string;
   ship:     number;   // fixed sprite index — stable across all clients
+  cls:      ShipClassId; // fixed RPG class — gives the arena class variety + marker
   level:    number;   // fixed at spawn — gives the leaderboard meaningful variety
   x:        number;
   y:        number;
@@ -60,12 +68,18 @@ function botName(): string {
 function botLevel(): number {
   return 1 + Math.floor(Math.random() ** 2 * 18);
 }
+// Half the bots stay 'normal'; the rest pick a random role, so the arena shows a
+// mix of class markers without flooding it with exotic builds.
+function botClass(): ShipClassId {
+  if (Math.random() < 0.5) return 'normal';
+  return SHIP_CLASS_ORDER[1 + Math.floor(Math.random() * (SHIP_CLASS_ORDER.length - 1))];
+}
 
 export interface BotController {
   /** Advance every bot one step (steer/shoot via `grid`, seek bonuses via
    *  `bonuses`), writing new positions into the shared players map; returns the
-   *  laser shots fired this tick. */
-  tick(now: number, grid: SpatialGrid, bonuses: BonusPos[]): BotShot[];
+   *  laser shots fired this tick. `isBoss` ids are never targeted (bots ignore the boss). */
+  tick(now: number, grid: SpatialGrid, bonuses: BonusPos[], isBoss?: (id: number) => boolean): BotShot[];
   damageBot(id: number, damage: number, shooterId: number): void;
   knockBot(id: number, fromX: number, fromY: number): void;
   /** Apply a picked-up bonus's effect to a bot (used immediately, no holding).
@@ -87,11 +101,11 @@ function steerBot(bot: Bot, dx: number, dy: number, speedMult: number): void {
 
   const desired = (Math.atan2(dy, dx) + Math.PI / 2) * 180 / Math.PI;
   const diff    = ((desired - bot.angle + 540) % 360) - 180;
-  bot.angle    += Math.max(-3, Math.min(3, diff));
+  bot.angle    += Math.max(-BOT_TURN_STEP, Math.min(BOT_TURN_STEP, diff));
   bot.angle     = ((bot.angle + 540) % 360) - 180;
 
   const rotRad = (bot.angle - 90) * Math.PI / 180;
-  const speed  = BOT_SPEED * speedMult;
+  const speed  = BOT_SPEED * speedMult * GAME_SPEED;
   bot.vx = bot.vx * 0.94 + Math.cos(rotRad) * speed * 0.06;
   bot.vy = bot.vy * 0.94 + Math.sin(rotRad) * speed * 0.06;
 
@@ -111,7 +125,10 @@ export function startBots(
   const bots: Bot[] = [];
   const botIds          = new Set<number>();
   const difficulty      = botDifficultyMult(difficultyLevel);  // 0–1 strength multiplier
-  const effectiveRange  = BOT_SHOOT_RANGE * difficulty;
+  // Shoot/detection range scales with the global game speed too (like ship + bolt
+  // speed), so engagements stay proportional as the arena speeds up.
+  const effectiveRange  = BOT_SHOOT_RANGE * difficulty * GAME_SPEED;
+  const fullRange       = BOT_SHOOT_RANGE * GAME_SPEED;            // detection while powered (no difficulty handicap)
   const effectiveCooldown = difficulty > 0 ? BOT_SHOOT_COOLDOWN_MS / difficulty : Infinity;
   const shootRangeSq    = effectiveRange * effectiveRange;
 
@@ -119,15 +136,17 @@ export function startBots(
     const id    = allocateId();
     const pos   = rndPos();
     const level = botLevel();
+    const cls   = botClass();
     const bot: Bot = {
       id, ...pos,
       name:     botName(),
       ship:     Math.floor(Math.random() * SHIP_COUNT),
+      cls,
       level,
       angle:    Math.random() * 360 - 180,
       vx: 0, vy: 0,
       ...rndTarget(),
-      hp:       maxHpForLevel(level),
+      hp:       maxHpForLevel(level, cls),
       dead:     false,
       lastShot: Date.now() + Math.random() * BOT_SHOOT_COOLDOWN_MS,
       stunnedUntil: 0,
@@ -138,18 +157,18 @@ export function startBots(
     };
     bots.push(bot);
     botIds.add(id);
-    players.set(id, { id, x: bot.x, y: bot.y, angle: bot.angle, dead: false, level: bot.level, xp: 0, name: bot.name, ship: bot.ship, teamId: 0, bot: true });
+    players.set(id, { id, x: bot.x, y: bot.y, angle: bot.angle, dead: false, level: bot.level, xp: 0, name: bot.name, ship: bot.ship, cls: bot.cls, teamId: 0, bot: true });
   }
 
   for (const bot of bots) {
     app.publish('all', JSON.stringify({
       type: 'player_join',
-      player: { id: bot.id, x: bot.x, y: bot.y, angle: bot.angle, level: bot.level, name: bot.name, ship: bot.ship, bot: true },
+      player: { id: bot.id, x: bot.x, y: bot.y, angle: bot.angle, level: bot.level, name: bot.name, ship: bot.ship, cls: bot.cls, bot: true },
     } as ServerMessage));
   }
 
   // Advance every bot one step — driven by the server's unified 20 Hz tick.
-  function tick(now: number, grid: SpatialGrid, bonuses: BonusPos[]): BotShot[] {
+  function tick(now: number, grid: SpatialGrid, bonuses: BonusPos[], isBoss?: (id: number) => boolean): BotShot[] {
     const shots: BotShot[] = [];
 
     for (const bot of bots) {
@@ -172,14 +191,14 @@ export function startBots(
       // the difficulty handicap) and a movement boost, so the power-up is used
       // aggressively rather than passively held.
       const powered  = bot.megaUntil > now || bot.invincibleUntil > now;
-      const detectSq = powered ? BOT_SHOOT_RANGE * BOT_SHOOT_RANGE : shootRangeSq;
+      const detectSq = powered ? fullRange * fullRange : shootRangeSq;
 
       // Nearest live player within detection range — used both to aim (steer) and
       // to fire. The grid bounds the search to the cells around the bot. (Holder
       // object so the closure write survives control-flow narrowing.)
       const aim = { target: null as ServerPlayer | null, distSq: detectSq };
       grid.forEachNear(bot.x, bot.y, 1, (other) => {
-        if (other.id === bot.id || other.dead) return;
+        if (other.id === bot.id || other.dead || (isBoss && isBoss(other.id))) return;
         const dx = other.x - bot.x, dy = other.y - bot.y;
         const d2 = dx * dx + dy * dy;
         if (d2 < aim.distSq) { aim.distSq = d2; aim.target = other; }
@@ -232,8 +251,8 @@ export function startBots(
           shots.push({
             shooterId: bot.id, targetId: target.id,
             x: Math.round(bot.x), y: Math.round(bot.y),
-            vx: Math.round(fx * LASER_SPEED),
-            vy: Math.round(fy * LASER_SPEED),
+            vx: Math.round(fx * LASER_SPEED * GAME_SPEED),
+            vy: Math.round(fy * LASER_SPEED * GAME_SPEED),
           });
         }
       }
@@ -267,7 +286,7 @@ export function startBots(
       bot.angle = Math.random() * 360 - 180;
       bot.vx    = 0;
       bot.vy    = 0;
-      bot.hp    = maxHpForLevel(bot.level);
+      bot.hp    = maxHpForLevel(bot.level, bot.cls);
       bot.dead  = false;
       bot.invincibleUntil = 0;
       bot.shieldHits      = 0;
@@ -291,7 +310,7 @@ export function startBots(
     let dx = bot.x - fromX; dx = ((dx + WORLD_WIDTH  * 1.5) % WORLD_WIDTH)  - WORLD_WIDTH  / 2;
     let dy = bot.y - fromY; dy = ((dy + WORLD_HEIGHT * 1.5) % WORLD_HEIGHT) - WORLD_HEIGHT / 2;
     const d = Math.hypot(dx, dy) || 1;
-    const speed = KNOCKBACK_SPEED_MULT * BOT_SPEED;
+    const speed = KNOCKBACK_SPEED_MULT * BOT_SPEED * GAME_SPEED;
     bot.vx = (dx / d) * speed;
     bot.vy = (dy / d) * speed;
     bot.spin = (Math.random() < 0.5 ? -1 : 1) * KNOCKBACK_SPIN_DEG;
@@ -304,7 +323,7 @@ export function startBots(
     if (!bot || bot.dead) return;
     const now = Date.now();
     switch (kind) {
-      case 'fix':         bot.hp = maxHpForLevel(bot.level);                 break;
+      case 'fix':         bot.hp = maxHpForLevel(bot.level, bot.cls);        break;
       case 'invincible':  bot.invincibleUntil = now + BONUS_INVINCIBLE_MS;  break;
       case 'mega_weapon': bot.megaUntil       = now + BONUS_MEGA_MS;        break;
       case 'shield':      bot.shieldHits      = BONUS_SHIELD_HITS;          break;

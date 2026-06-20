@@ -21,6 +21,10 @@ export class RemoteShips {
   private hp       = new Map<number, number>();
   private world    = new Map<number, { x: number; y: number }>();
   private shieldUntil = new Map<number, number>();   // ms timestamp the shield ring stops showing
+  private names    = new Map<number, string>();      // raw pseudo (label text adds ⭐ for teammates)
+  private teams    = new Map<number, number>();      // each ship's teamId (0 = none)
+  private localTeam = 0;                             // the viewer's own teamId
+  private botIds   = new Set<number>();              // ids that are AI bots (dev)
   readonly healthBars: Phaser.GameObjects.Graphics;
 
   constructor(private scene: Phaser.Scene) {
@@ -50,6 +54,39 @@ export class RemoteShips {
       stroke: '#000000', strokeThickness: 3,
     }).setOrigin(0.5, 1).setDepth(6).setVisible(false);
     this.labels.set(player.id, label);
+    this.names.set(player.id, player.name);
+    this.teams.set(player.id, player.teamId ?? 0);
+    if (player.bot) this.botIds.add(player.id);
+    this.applyLabelStyle(player.id);
+  }
+
+  /** True for AI bots — human laser hits are kept visual-free, bot hits aren't. */
+  isBot(id: number): boolean { return this.botIds.has(id); }
+
+  /** True when this ship shares the viewer's (non-zero) team. */
+  isTeammate(id: number): boolean {
+    return this.localTeam !== 0 && this.teams.get(id) === this.localTeam;
+  }
+
+  /** Update one ship's team membership (from `team_set`) and restyle its label. */
+  setTeam(id: number, teamId: number): void {
+    this.teams.set(id, teamId);
+    this.applyLabelStyle(id);
+  }
+
+  /** The viewer's own team changed → re-evaluate every label's teammate styling. */
+  setLocalTeam(teamId: number): void {
+    this.localTeam = teamId;
+    for (const id of this.labels.keys()) this.applyLabelStyle(id);
+  }
+
+  /** Teammates show their pseudo in green wrapped in stars; everyone else default. */
+  private applyLabelStyle(id: number): void {
+    const label = this.labels.get(id);
+    if (!label) return;
+    const name = this.names.get(id) ?? '';
+    if (this.isTeammate(id)) label.setText(`⭐ ${name} ⭐`).setColor('#33ff66');
+    else                     label.setText(name).setColor('#cfe8ff');
   }
 
   remove(id: number): void {
@@ -61,6 +98,9 @@ export class RemoteShips {
     this.hp.delete(id);
     this.world.delete(id);
     this.shieldUntil.delete(id);
+    this.names.delete(id);
+    this.teams.delete(id);
+    this.botIds.delete(id);
   }
 
   /** Render a power-up effect on a remote ship (driven by `player_effect`):
@@ -78,7 +118,7 @@ export class RemoteShips {
     }
   }
 
-  rename(id: number, name: string): void { this.labels.get(id)?.setText(name); }
+  rename(id: number, name: string): void { this.names.set(id, name); this.applyLabelStyle(id); }
 
   /** Store a ship's authoritative (server, wrapped) world position. */
   setWorld(id: number, x: number, y: number): void {

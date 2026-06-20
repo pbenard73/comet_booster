@@ -4,9 +4,11 @@ import {
   LASER_CONE_LEVEL, LASER_CONE_STEP_DEG, LASER_WING_SPACING,
   LASER_BASE_CHARGES, LASER_CHARGE_REGEN_MS, LASER_CHARGES_PER_5LV,
   LASER_HIT_FRACTION, BOT_SHOOT_DAMAGE, BONUS_MEGA_COOLDOWN_MS,
+  WORLD_WIDTH, WORLD_HEIGHT, inSafeZone,
 } from '@shared/constants';
+import { wrap } from './torus';
 import { shipScaleForLevel } from './scale';
-import { showLaserHit } from './effects';
+import { showLaserHit, showForceFieldHit } from './effects';
 import type { RemoteShips } from './RemoteShips';
 
 interface Bolt {
@@ -26,6 +28,7 @@ export interface LaserDeps {
   remoteShips: RemoteShips;
   onHitRemote: (id: number) => void;                          // landed our bolt on a ship
   hitSelf: (amount: number, shooterId: number | null) => void; // an incoming bolt reached us
+  onFire: (bolts: Array<{ x: number; y: number; vx: number; vy: number }>) => void; // broadcast my bolts so others see them
 }
 
 export class LaserSystem {
@@ -40,6 +43,10 @@ export class LaserSystem {
   // Mega-weapon bonus: until this time, fire on a short cooldown and consume no
   // charges (unlimited burst).
   private megaUntil = 0;
+
+  // Throttle the refuge-deflection "bong" so a volley hitting the field at once
+  // doesn't stack a wall of sound.
+  private lastDeflectSound = 0;
 
   constructor(private scene: Phaser.Scene, private deps: LaserDeps) {
     this.buildTexture();
@@ -98,6 +105,9 @@ export class LaserSystem {
     const noseX  = ship.x + Math.cos(fwdRad) * nose;
     const noseY  = ship.y + Math.sin(fwdRad) * nose;
 
+    // Collect each bolt's spawn so the volley can be broadcast for other clients.
+    const fired: Array<{ x: number; y: number; vx: number; vy: number }> = [];
+
     if (level < LASER_CONE_LEVEL) {
       // Straight parallel lasers
       const count = Math.min(Math.floor(level / 5) + 1, 5);
@@ -108,7 +118,9 @@ export class LaserSystem {
       const vy    = Math.sin(fwdRad) * LASER_SPEED;
       for (let i = 0; i < count; i++) {
         const d = -half + i * LASER_WING_SPACING;
-        this.spawnBolt(noseX + latX * d, noseY + latY * d, vx, vy, ship.rotation, range);
+        const bx = noseX + latX * d, by = noseY + latY * d;
+        this.spawnBolt(bx, by, vx, vy, ship.rotation, range);
+        fired.push({ x: bx, y: by, vx, vy });
       }
     } else {
       // Cone / fan mode
@@ -117,10 +129,13 @@ export class LaserSystem {
       for (let i = 0; i < count; i++) {
         const offsetRad = (-half + i * LASER_CONE_STEP_DEG) * (Math.PI / 180);
         const angleRad  = fwdRad + offsetRad;
-        this.spawnBolt(noseX, noseY, Math.cos(angleRad) * LASER_SPEED, Math.sin(angleRad) * LASER_SPEED, ship.rotation + offsetRad, range);
+        const vx = Math.cos(angleRad) * LASER_SPEED, vy = Math.sin(angleRad) * LASER_SPEED;
+        this.spawnBolt(noseX, noseY, vx, vy, ship.rotation + offsetRad, range);
+        fired.push({ x: noseX, y: noseY, vx, vy });
       }
     }
 
+    this.deps.onFire(fired);
     this.scene.sound.play('sfx_laser', { volume: 0.15 });
   }
 
@@ -153,14 +168,34 @@ export class LaserSystem {
         continue;
       }
 
+      // Refuge force field: a laser can't enter a safe zone — it's deflected at
+      // the boundary with a "bong" and a ripple, no matter who fired it.
+      if (inSafeZone(wrap(bolt.image.x, WORLD_WIDTH), wrap(bolt.image.y, WORLD_HEIGHT))) {
+        showForceFieldHit(this.scene, bolt.image.x, bolt.image.y);
+        const now = this.scene.time.now;
+        if (now - this.lastDeflectSound > 60) {
+          this.lastDeflectSound = now;
+          this.scene.sound.play('sfx_deflect', { volume: 0.5, rate: 0.6 });
+        }
+        bolt.image.destroy();
+        this.bolts.splice(i, 1);
+        continue;
+      }
+
       // Incoming bot laser → damage only on real contact with my ship.
       if (bolt.remote) {
         const ship = this.deps.ship();
-        if (!this.deps.isDead() && ship.visible && this.scene.time.now >= this.deps.invincibleUntil()) {
+        // No friendly fire: a teammate's bolt flies through us untouched.
+        const teammate = bolt.shooterId !== undefined && this.deps.remoteShips.isTeammate(bolt.shooterId);
+        if (!teammate && !this.deps.isDead() && ship.visible && this.scene.time.now >= this.deps.invincibleUntil()) {
           const myRadius = (ship.displayWidth / 2) * LASER_HIT_FRACTION;
           if (Phaser.Math.Distance.Between(bolt.image.x, bolt.image.y, ship.x, ship.y) < myRadius) {
             showLaserHit(this.scene, bolt.image.x, bolt.image.y);
-            this.deps.hitSelf(BOT_SHOOT_DAMAGE, bolt.shooterId ?? null);
+            // Bot bolts deal their damage here; human bolts are visual only —
+            // a human's damage arrives authoritatively via `player_hit`.
+            if (bolt.shooterId !== undefined && this.deps.remoteShips.isBot(bolt.shooterId)) {
+              this.deps.hitSelf(BOT_SHOOT_DAMAGE, bolt.shooterId);
+            }
             bolt.image.destroy();
             this.bolts.splice(i, 1);
           }
@@ -168,9 +203,10 @@ export class LaserSystem {
         continue;
       }
 
-      // My laser → hit the first visible remote ship it touches.
+      // My laser → hit the first visible remote ship it touches (teammates are
+      // skipped: no friendly fire, the bolt passes through them).
       for (const [hitId, sprite] of this.deps.remoteShips.entries()) {
-        if (!sprite.visible) continue;
+        if (!sprite.visible || this.deps.remoteShips.isTeammate(hitId)) continue;
         const hitRadius = (sprite.displayWidth / 2) * LASER_HIT_FRACTION;
         if (Phaser.Math.Distance.Between(bolt.image.x, bolt.image.y, sprite.x, sprite.y) < hitRadius) {
           showLaserHit(this.scene, bolt.image.x, bolt.image.y);

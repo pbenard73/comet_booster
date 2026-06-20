@@ -9,9 +9,11 @@ import type { ServerPlayer } from './score.js';
  *
  * The cell size is ≥ AOI_RADIUS, so every ship within the area-of-interest of a
  * point sits in that point's own cell or one of the 8 around it (`range = 1`).
- * Like the rest of the server's AoI maths this is **not** torus-aware — positions
- * are already wrapped into [0, WORLD), and seam/distant ships are kept fresh by
- * the 2 Hz `minimap_update` (which has no AoI filter).
+ * The neighbour walk is **torus-aware**: the (2·range+1)² window wraps across the
+ * world seam, so a viewer parked at an edge (e.g. a pole refuge at x=0) still sees
+ * ships just past the wrap at the full tick rate instead of only via the 2 Hz
+ * `minimap_update`. Callers must still apply a torus-shortest distance test —
+ * wrapping only fixes which buckets are visited, not the metric.
  */
 export class SpatialGrid {
   private readonly cols = Math.ceil(WORLD_WIDTH  / GRID_CELL);
@@ -30,15 +32,21 @@ export class SpatialGrid {
     }
   }
 
-  /** Visit every player in the (2·range+1)² block of cells around (x, y). */
+  /** Visit every player in the (2·range+1)² block of cells around (x, y), with the
+   *  window wrapping across the world seam (torus-aware). When an axis spans only
+   *  ≤ 2·range+1 cells, every cell on it is walked once (wrapping would otherwise
+   *  revisit the same bucket and double-count). */
   forEachNear(x: number, y: number, range: number, cb: (p: ServerPlayer) => void): void {
+    const cols = this.cols, rows = this.rows;
     const cx = Math.floor(x / GRID_CELL);
     const cy = Math.floor(y / GRID_CELL);
-    const gx0 = Math.max(0, cx - range), gx1 = Math.min(this.cols - 1, cx + range);
-    const gy0 = Math.max(0, cy - range), gy1 = Math.min(this.rows - 1, cy + range);
-    for (let gy = gy0; gy <= gy1; gy++) {
-      for (let gx = gx0; gx <= gx1; gx++) {
-        const cell = this.cells.get(gy * this.cols + gx);
+    const fullX = cols <= 2 * range + 1;
+    const fullY = rows <= 2 * range + 1;
+    for (let oy = fullY ? 0 : -range; oy <= (fullY ? rows - 1 : range); oy++) {
+      const gy = fullY ? oy : (((cy + oy) % rows) + rows) % rows;
+      for (let ox = fullX ? 0 : -range; ox <= (fullX ? cols - 1 : range); ox++) {
+        const gx = fullX ? ox : (((cx + ox) % cols) + cols) % cols;
+        const cell = this.cells.get(gy * cols + gx);
         if (cell) for (const p of cell) cb(p);
       }
     }

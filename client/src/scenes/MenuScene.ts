@@ -1,5 +1,6 @@
 import Phaser from 'phaser';
 import { MAX_NAME_LEN } from '@shared/constants';
+import { TeamSelect } from '../menu/TeamSelect';
 
 const PSEUDO_KEY = 'comet_pseudo';
 
@@ -7,6 +8,8 @@ export class MenuScene extends Phaser.Scene {
   private pseudo   = '';
   private cursorOn = true;
   private nameText!: Phaser.GameObjects.Text;
+  private teamSelect!: TeamSelect;
+  private choosing = false;   // team modal open → ignore pseudo keystrokes
 
   constructor() { super('Menu'); }
 
@@ -50,7 +53,7 @@ export class MenuScene extends Phaser.Scene {
     this.pseudo = (localStorage.getItem(PSEUDO_KEY) ?? '').slice(0, MAX_NAME_LEN);
     this.renderName();
 
-    const hint = this.add.text(cx, cy + 80, '[ ENTER to launch ]', {
+    const hint = this.add.text(cx, cy + 80, '[ ENTER to continue ]', {
       fontSize: '20px', color: '#ffffff', fontFamily: 'Kenney, monospace',
     }).setOrigin(0.5);
     this.tweens.add({
@@ -67,9 +70,12 @@ export class MenuScene extends Phaser.Scene {
       callback: () => { this.cursorOn = !this.cursorOn; this.renderName(); },
     });
 
+    this.teamSelect = new TeamSelect();
+
     this.input.keyboard!.on('keydown', this.onKey, this);
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       this.input.keyboard!.off('keydown', this.onKey, this);
+      this.teamSelect.destroy();
     });
   }
 
@@ -78,9 +84,10 @@ export class MenuScene extends Phaser.Scene {
   }
 
   private onKey(event: KeyboardEvent): void {
+    if (this.choosing) return;   // typing goes to the team modal's own DOM input
     if (event.key === 'Enter') {
       event.preventDefault();
-      this.launch();
+      this.proceed();
       return;
     }
     if (event.key === 'Backspace') {
@@ -97,10 +104,16 @@ export class MenuScene extends Phaser.Scene {
     }
   }
 
-  private launch(): void {
+  /** ENTER on the callsign → ask whether to join a team, then launch. */
+  private proceed(): void {
     let name = this.pseudo.trim();
     if (!name) name = 'Pilot' + Math.floor(100 + Math.random() * 900);
     localStorage.setItem(PSEUDO_KEY, name);
-    this.scene.start('Game', { name });
+
+    this.choosing = true;
+    this.teamSelect.open((inviteTargetId) => {
+      this.choosing = false;
+      this.scene.start('Game', { name, inviteTargetId: inviteTargetId ?? undefined });
+    });
   }
 }

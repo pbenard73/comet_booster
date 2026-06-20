@@ -75,7 +75,7 @@ export class Hud {
       .setOrigin(0.5, 0.5).setScrollFactor(0).setDepth(12);
     this.layoutBoost(width, height);
 
-    this.hints = scene.add.text(10, height - 24, 'ARROWS move   SPACE fire   CTRL boost   SHIFT bonus   ESC menu', {
+    this.hints = scene.add.text(10, height - 24, 'ARROWS move   DOWN brake   SPACE fire   CTRL boost   SHIFT bonus   ESC menu', {
       fontSize: '12px', color: '#333333', fontFamily: FONT,
     }).setScrollFactor(0).setDepth(10);
 

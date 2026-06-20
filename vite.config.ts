@@ -20,6 +20,11 @@ export default defineConfig({
         ws:           true,
         changeOrigin: true,
       },
+      // Team search runs over HTTP (the menu has no WebSocket) → proxy to uWS.
+      '/api': {
+        target:       'http://localhost:4000',
+        changeOrigin: true,
+      },
     },
   },
   build: {

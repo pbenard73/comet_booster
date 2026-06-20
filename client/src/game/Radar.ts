@@ -14,12 +14,22 @@ const GLOBE_RANGE = Math.hypot(WORLD_WIDTH / 2, WORLD_HEIGHT / 2);
  */
 export class Radar {
   private g: Phaser.GameObjects.Graphics;
+  private nLabel: Phaser.GameObjects.Text;
+  private sLabel: Phaser.GameObjects.Text;
 
   constructor(private scene: Phaser.Scene) {
     this.g = scene.add.graphics().setScrollFactor(0).setDepth(20);
+    const labelStyle = { fontFamily: 'Kenney, monospace', fontSize: '12px', color: '#dff4ff' };
+    this.nLabel = scene.add.text(0, 0, 'N', labelStyle).setScrollFactor(0).setDepth(21).setOrigin(0.5);
+    this.sLabel = scene.add.text(0, 0, 'S', labelStyle).setScrollFactor(0).setDepth(21).setOrigin(0.5);
   }
 
-  draw(shipX: number, shipY: number, sprites: Iterable<Phaser.GameObjects.Image>): void {
+  draw(
+    shipX: number,
+    shipY: number,
+    ships: Iterable<[number, Phaser.GameObjects.Image]>,
+    isTeammate: (id: number) => boolean,
+  ): void {
     const R  = MAP_SIZE / 2;
     const cx = this.scene.scale.width  - R - MAP_PAD;
     const cy = this.scene.scale.height - R - MAP_PAD;
@@ -56,6 +66,34 @@ export class Radar {
       return [cx + Math.cos(lam) * r, cy + Math.sin(lam) * r];
     };
 
+    // Project an absolute world point onto the globe (torus-wrapped delta from the
+    // local ship), reporting which hemisphere it lands on. Used for the fixed
+    // geographic reference features (Greenwich meridian, equator, poles) and blips.
+    const projWorld = (wx: number, wy: number) => {
+      let dx = wx - shipX; dx = ((dx + WORLD_WIDTH  * 1.5) % WORLD_WIDTH)  - WORLD_WIDTH  / 2;
+      let dy = wy - shipY; dy = ((dy + WORLD_HEIGHT * 1.5) % WORLD_HEIGHT) - WORLD_HEIGHT / 2;
+      const phi = Math.min(Math.hypot(dx, dy) / GLOBE_RANGE, 1) * Math.PI;
+      const r   = Math.sin(phi) * R;
+      const lam = Math.atan2(dy, dx);
+      return { sx: cx + Math.cos(lam) * r, sy: cy + Math.sin(lam) * r, front: Math.cos(phi) >= 0 };
+    };
+
+    // Stroke a world-space line (pre-sampled into points) onto the globe. Segments
+    // whose endpoints jump too far apart (the torus seam, or a pass behind a pole)
+    // are skipped so the curve never streaks across the face; back-hemisphere
+    // segments are dimmed.
+    const strokeWorldLine = (pts: Array<ReturnType<typeof projWorld>>, color: number, frontA: number, backA: number) => {
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i], b = pts[i + 1];
+        if (Math.hypot(b.sx - a.sx, b.sy - a.sy) > R) continue;
+        g.lineStyle(1.25, color, a.front && b.front ? frontA : backA);
+        g.beginPath();
+        g.moveTo(a.sx, a.sy);
+        g.lineTo(b.sx, b.sy);
+        g.strokePath();
+      }
+    };
+
     // Visible viewport outline — the camera shows scale.width × scale.height of
     // world centred on the ship (1× zoom). Sample along each edge so the rectangle
     // curves with the sphere instead of cutting straight across it.
@@ -78,26 +116,47 @@ export class Radar {
     g.closePath();
     g.strokePath();
 
-    // Blips. Back hemisphere drawn first (dim), front collected to draw on top.
-    const front: Array<[number, number]> = [];
+    // Fixed geographic reference features, projected through the same player-centric
+    // mapping so they curve & slide across the globe as the ship flies. World ↔ map:
+    // LON = x/W·360 (Greenwich = x 0), LAT = y/H·360 (equator = y H/2, poles ±90°).
+    const SAMPLES = 64;
+    const greenwich: Array<ReturnType<typeof projWorld>> = [];
+    const equator:   Array<ReturnType<typeof projWorld>> = [];
+    for (let i = 0; i <= SAMPLES; i++) {
+      greenwich.push(projWorld(0, (i / SAMPLES) * WORLD_HEIGHT));            // meridian x=0
+      equator.push(projWorld((i / SAMPLES) * WORLD_WIDTH, WORLD_HEIGHT / 2)); // parallel y=H/2
+    }
+    strokeWorldLine(equator,   0xffcc33, 0.55, 0.18); // equator — gold
+    strokeWorldLine(greenwich, 0x33e0ff, 0.65, 0.20); // Greenwich meridian — cyan
+
+    // Poles: points on the Greenwich meridian, ±90° latitude (a quarter-world either
+    // side of the equator). Markers + N/S labels, dimmed on the back hemisphere.
+    const np = projWorld(0, WORLD_HEIGHT * 0.25);
+    const sp = projWorld(0, WORLD_HEIGHT * 0.75);
+    g.fillStyle(0xdff4ff, 1);
+    g.fillCircle(np.sx, np.sy, 1.8).fillCircle(sp.sx, sp.sy, 1.8);
+    this.nLabel.setPosition(np.sx, np.sy - 8).setAlpha(np.front ? 1 : 0.4);
+    this.sLabel.setPosition(sp.sx, sp.sy + 8).setAlpha(sp.front ? 1 : 0.4);
+
+    // Blips. Back hemisphere drawn first (dim); front + teammates collected to
+    // draw on top. Teammates are bright green and drawn above everyone.
+    const frontBlips: Array<[number, number]> = [];
+    const teamBlips:  Array<[number, number]> = [];
     g.fillStyle(0x6688aa, 0.40);
-    for (const sprite of sprites) {
+    for (const [id, sprite] of ships) {
       if (!sprite.visible) continue;
-      let dx = sprite.x - shipX; dx = ((dx + WORLD_WIDTH  * 1.5) % WORLD_WIDTH)  - WORLD_WIDTH  / 2;
-      let dy = sprite.y - shipY; dy = ((dy + WORLD_HEIGHT * 1.5) % WORLD_HEIGHT) - WORLD_HEIGHT / 2;
-      const phi = Math.min(Math.hypot(dx, dy) / GLOBE_RANGE, 1) * Math.PI;
-      const r   = Math.sin(phi) * R;
-      const lam = Math.atan2(dy, dx);
-      const sx  = cx + Math.cos(lam) * r;
-      const sy  = cy + Math.sin(lam) * r;
-      if (Math.cos(phi) >= 0) front.push([sx, sy]);
-      else g.fillCircle(sx, sy, 1.4);
+      const { sx, sy, front: isFront } = projWorld(sprite.x, sprite.y);
+      if (isTeammate(id)) teamBlips.push([sx, sy]);
+      else if (isFront)   frontBlips.push([sx, sy]);
+      else                g.fillCircle(sx, sy, 1.4);
     }
 
-    // Silhouette, then front blips on top of the wireframe.
+    // Silhouette, then front blips, then teammates on top of the wireframe.
     g.lineStyle(1.5, 0x4aa6d0, 0.6).strokeCircle(cx, cy, R);
     g.fillStyle(0xcfe8ff, 0.95);
-    for (const [sx, sy] of front) g.fillCircle(sx, sy, 2.2);
+    for (const [sx, sy] of frontBlips) g.fillCircle(sx, sy, 2.2);
+    g.fillStyle(0x33ff66, 1);
+    for (const [sx, sy] of teamBlips) g.fillCircle(sx, sy, 3.2);
 
     // Local player — fixed at the centre.
     g.fillStyle(0xff2222, 1).fillCircle(cx, cy, 3.2);

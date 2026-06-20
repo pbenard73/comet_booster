@@ -3,6 +3,8 @@ export const WORLD_HEIGHT          = 10_000;
 export const PLAYER_SPEED          = 500;
 export const PLAYER_ROTATION_SPEED = 200;
 export const PLAYER_THRUST_SPEED   = 200;  // px/s — normal forward thrust speed
+export const SHIP_DRAG              = 0.98; // damping multiplier/s while coasting (gentle drift)
+export const BRAKE_DRAG             = 0.1;  // damping multiplier/s while braking (DOWN arrow) — ~stops in ~2 s
 
 // Boost gauge — hold CONTROL while thrusting to accelerate to BOOST_SPEED_MULT×
 // the thrust speed (to chase or escape). Draining a full gauge takes
@@ -71,6 +73,34 @@ export const SERVER_TICK_MS         = 50;    // ms — unified authoritative bro
 export const GRID_CELL              = AOI_RADIUS; // spatial-hash cell size (≥ AOI so a 3×3 block covers it)
 export const MAX_NEIGHBORS          = 80;    // interest cap: max ships streamed to one client per tick
 
+// Pole safe zones (refuges). A circular sanctuary centred on each geographic
+// pole (Greenwich meridian, ±90° latitude): inside it ships cannot fire,
+// cannot collide, and take no damage from outside. 500 px diameter.
+export const SAFE_ZONE_RADIUS = 250;   // px (→ 500 px diameter)
+export const SAFE_ZONES: ReadonlyArray<{ x: number; y: number }> = [
+  { x: 0, y: WORLD_HEIGHT / 4 },        // North pole (+90° lat on the Greenwich meridian)
+  { x: 0, y: (WORLD_HEIGHT * 3) / 4 },  // South pole (−90° lat on the Greenwich meridian)
+];
+
+/** Shortest signed delta between `a` and `b` on a wrapped axis of length `size`. */
+export function torusDelta(a: number, b: number, size: number): number {
+  let d = a - b;
+  if (d >  size / 2) d -= size;
+  else if (d < -size / 2) d += size;
+  return d;
+}
+
+/** Is world point (x, y) inside any pole safe zone? Torus-aware (the zones sit
+ *  on the x=0 seam, so a straight distance check would miss the wrapped half). */
+export function inSafeZone(x: number, y: number): boolean {
+  for (const z of SAFE_ZONES) {
+    const dx = torusDelta(x, z.x, WORLD_WIDTH);
+    const dy = torusDelta(y, z.y, WORLD_HEIGHT);
+    if (dx * dx + dy * dy <= SAFE_ZONE_RADIUS * SAFE_ZONE_RADIUS) return true;
+  }
+  return false;
+}
+
 // Leaderboard
 export const LEADERBOARD_SIZE       = 10;    // entries shown in the top-right ranking
 export const LEADERBOARD_REFRESH_MS = 1000;  // ms — server recomputes & broadcasts ranking (1 Hz)
@@ -93,6 +123,9 @@ export const BONUS_SHIELD_VISUAL_MS  = 9000;   // ms a remote shield ring is sho
 // Bot bonus behaviour
 export const BOT_BONUS_SEEK_RANGE    = 1200;   // px — bots steer toward a bonus within this range
 export const BOT_POWERED_SPEED_MULT  = 1.4;    // movement boost while a bonus effect is active
+
+// Bots
+export const BOT_COUNT             = 150;   // number of AI bots spawned in dev (NODE_ENV !== 'production')
 
 // Bot shooting
 export const BOT_DIFFICULTY        = 0.3;   // 0 = never shoot  1 = full strength  >1 = harder

@@ -3,6 +3,7 @@ import { Network } from '../network/Network';
 import {
   WORLD_WIDTH, WORLD_HEIGHT,
   PLAYER_SPEED, PLAYER_ROTATION_SPEED, PLAYER_THRUST_SPEED, SEND_RATE_MS,
+  SHIP_DRAG, BRAKE_DRAG, inSafeZone,
   BOOST_SPEED_MULT, BOOST_DURATION_MS, BOOST_REGEN_MS, BOOST_MIN_CHARGE,
   COLLISION_RADIUS, BASE_HP, DAMAGE_PER_HIT, DAMAGE_COOLDOWN_MS,
   KNOCKBACK_STUN_MS, KNOCKBACK_SPEED_MULT, KNOCKBACK_SPIN_DEG,
@@ -17,11 +18,13 @@ import { wrap, nearestImage } from '../game/torus';
 import { drawHpBar } from '../game/healthbar';
 import { showExplosion, showLaserHit, showLevelUpEffect, startBlink, showDeathOverlay, showShieldBlock } from '../game/effects';
 import { Starfield } from '../game/Starfield';
+import { SafeZone } from '../game/SafeZone';
 import { Radar } from '../game/Radar';
 import { Hud } from '../game/Hud';
 import { RemoteShips } from '../game/RemoteShips';
 import { LaserSystem } from '../game/LaserSystem';
 import { BonusSystem } from '../game/BonusSystem';
+import { InvitePopup } from '../game/InvitePopup';
 
 /**
  * The game loop orchestrator. Owns the local player's state and ship, wires the
@@ -31,11 +34,13 @@ import { BonusSystem } from '../game/BonusSystem';
 export class GameScene extends Phaser.Scene {
   private network!: Network;
   private starfield!:   Starfield;
+  private safeZone!:    SafeZone;
   private radar!:       Radar;
   private hud!:         Hud;
   private remoteShips!: RemoteShips;
   private lasers!:      LaserSystem;
   private bonuses!:     BonusSystem;
+  private invitePopup!: InvitePopup;
 
   private myId: number | null = null;
   private ship!:        Phaser.Physics.Arcade.Image;
@@ -62,12 +67,22 @@ export class GameScene extends Phaser.Scene {
 
   private playerName = '';
   private isDead          = false;
+  // True while the local ship is inside a pole safe zone (refresh each frame):
+  // no firing, no collisions, no incoming damage.
+  private inSafe          = false;
   private invincibleUntil = 0;
   private stunnedUntil    = 0;
   private lastSent        = 0;
   private lastDamageTime  = 0;
   private lastDamagedBy: number | null = null;
   private myLevel = 1;
+  private myTeamId = 0;
+  private myName   = '';
+  // While a team-invite popup is up the invitee is frozen & invincible (cannot
+  // play, be hit, or use bonuses) until they answer (10 s timeout).
+  private inviteFreeze = false;
+  // Teammate chosen on the start screen → invite is sent once we spawn.
+  private pendingInviteTarget: number | null = null;
   private myHp    = BASE_HP;
   private myMaxHp = BASE_HP;
   private myXp    = 0;
@@ -77,8 +92,9 @@ export class GameScene extends Phaser.Scene {
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
-  init(data: { name?: string }): void {
+  init(data: { name?: string; inviteTargetId?: number }): void {
     this.playerName = (data?.name ?? '').trim();
+    this.pendingInviteTarget = data?.inviteTargetId ?? null;
   }
 
   async create(): Promise<void> {
@@ -90,6 +106,8 @@ export class GameScene extends Phaser.Scene {
     this.lastDamageTime  = 0;
     this.lastDamagedBy   = null;
     this.myLevel = 1;
+    this.myTeamId = 0;
+    this.inviteFreeze = false;
     this.myHp    = BASE_HP;
     this.myMaxHp = BASE_HP;
     this.myXp    = 0;
@@ -104,6 +122,7 @@ export class GameScene extends Phaser.Scene {
     this.physics.world.setBounds(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
 
     this.starfield   = new Starfield(this);
+    this.safeZone    = new SafeZone(this);
     this.buildPlayer();
     this.remoteShips = new RemoteShips(this);
     this.bonuses     = new BonusSystem(this);
@@ -117,8 +136,27 @@ export class GameScene extends Phaser.Scene {
       remoteShips:     this.remoteShips,
       onHitRemote:     (id) => this.network.send({ type: 'hit', targetId: id }),
       hitSelf:         (amount, shooterId) => this.applyIncomingLaser(amount, shooterId),
+      onFire:          (bolts) => this.network.send({
+        type: 'fire',
+        // Wrap to [0, WORLD) like sendPosition; receivers place each bolt at the
+        // torus image nearest them (nearestImage in the laser_spawn handler).
+        bolts: bolts.map(b => ({
+          x:  Math.round(wrap(b.x, WORLD_WIDTH)),
+          y:  Math.round(wrap(b.y, WORLD_HEIGHT)),
+          vx: Math.round(b.vx),
+          vy: Math.round(b.vy),
+        })),
+      }),
     });
     this.bindKeys();
+
+    // In-game confirmation popup for an incoming team invite (the request itself
+    // is initiated on the start screen). Answering keeps a 2 s invuln grace; a
+    // 10 s timeout closes the popup with none.
+    this.invitePopup = new InvitePopup({
+      onRespond: (fromId, ok) => { this.network.send({ type: 'team_invite_respond', fromId, accept: ok }); this.endInviteFreeze(true); },
+      onExpire:  (fromId)     => { this.network.send({ type: 'team_invite_respond', fromId, accept: false }); this.endInviteFreeze(false); },
+    });
 
     // No camera bounds: the ship roams in a continuous (un-wrapped) coordinate
     // space and the camera always centres it, so crossing the world seam is
@@ -128,6 +166,7 @@ export class GameScene extends Phaser.Scene {
     this.scale.on('resize', this.onResize, this);
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       this.scale.off('resize', this.onResize, this);
+      this.invitePopup.destroy();
     });
 
     await this.connectNetwork();
@@ -138,18 +177,24 @@ export class GameScene extends Phaser.Scene {
     // infinite starfield, before anything reads world positions this frame.
     this.remoteShips.updatePositions(this.ship.x, this.ship.y);
     this.starfield.scroll(this.ship.x, this.ship.y);
+    this.safeZone.draw(this.ship.x, this.ship.y, time);
     this.bonuses.reposition(this.ship.x, this.ship.y);
     this.boosting = false;   // handleInput re-arms it when CTRL+thrust is held
-    if (!this.isDead) {
+    // Inside a pole refuge: can't fire, collide, or be hit from outside.
+    this.inSafe = this.inMySafeZone();
+    if (this.inviteFreeze && !this.isDead) {
+      // Deciding on a team invite: hold still, no control/collision/fire/bonus.
+      this.ship.setVelocity(0, 0).setAngularVelocity(0);
+    } else if (!this.isDead) {
       // While stunned (post-collision) the ship flies & spins on its own — no
       // control, no firing, no new collisions — until it recovers.
       if (this.stunnedUntil > 0 && time >= this.stunnedUntil) this.endStun();
       const stunned = time < this.stunnedUntil;
       if (!stunned) {
         this.handleInput();
-        this.checkCollisions(time);
+        if (!this.inSafe) this.checkCollisions(time);
       }
-      this.lasers.shootIfReady(time, this.spaceKey.isDown && !stunned);
+      this.lasers.shootIfReady(time, this.spaceKey.isDown && !stunned && !this.inSafe);
       this.checkBonusPickup();
       this.sendPosition(time);
     }
@@ -162,7 +207,7 @@ export class GameScene extends Phaser.Scene {
     this.updateThruster();
     this.updateShieldAura();
     this.updateLabels();
-    this.radar.draw(this.ship.x, this.ship.y, this.remoteShips.sprites());
+    this.radar.draw(this.ship.x, this.ship.y, this.remoteShips.entries(), (id) => this.remoteShips.isTeammate(id));
 
     this.updateBonusHud();
     this.hud.setPlayers(this.remoteShips.size + 1);
@@ -197,7 +242,7 @@ export class GameScene extends Phaser.Scene {
 
     this.ship = this.physics.add
       .image(cx, cy, shipKey(0))   // placeholder — real sprite assigned from the 'init' message
-      .setDamping(true).setDrag(0.98).setMaxVelocity(PLAYER_SPEED)
+      .setDamping(true).setDrag(SHIP_DRAG).setMaxVelocity(PLAYER_SPEED)
       .setDepth(3).setScale(shipSpriteScale(1));
 
     this.myNameLabel = this.add.text(cx, cy, this.playerName, {
@@ -242,11 +287,17 @@ export class GameScene extends Phaser.Scene {
         if (me) {
           this.ship.setTexture(shipKey(me.ship)).setPosition(me.x, me.y);
           this.cameras.main.centerOn(me.x, me.y);
-          this.myNameLabel.setText(this.playerName || me.name);
+          this.myName = this.playerName || me.name;
+          this.applyMyLabelStyle();
         }
         players.forEach(p => { if (p.id !== id) this.remoteShips.spawn(p); });
         bonuses.forEach(b => this.bonuses.spawn(b));
         if (this.playerName) this.network.send({ type: 'set_name', name: this.playerName });
+        // Fire the team invite chosen on the start screen (target confirms in-game).
+        if (this.pendingInviteTarget !== null && this.pendingInviteTarget !== id) {
+          this.network.send({ type: 'team_invite_send', toId: this.pendingInviteTarget });
+        }
+        this.pendingInviteTarget = null;
       })
       .on('player_join', ({ player }) => {
         if (player.id !== this.myId) {
@@ -342,7 +393,7 @@ export class GameScene extends Phaser.Scene {
         }
       })
       .on('player_hit', ({ id, damage, shooterId }) => {
-        if (id === this.myId && !this.isDead && this.time.now >= this.invincibleUntil) {
+        if (id === this.myId && !this.isDead && !this.inviteFreeze && !this.inSafe && this.time.now >= this.invincibleUntil) {
           if (!this.consumeShield()) {
             this.myHp          = Math.max(0, this.myHp - damage);
             this.lastDamagedBy = shooterId;
@@ -374,8 +425,24 @@ export class GameScene extends Phaser.Scene {
         }
       })
       .on('player_rename', ({ id, name }) => {
-        if (id === this.myId) this.myNameLabel.setText(name);
+        if (id === this.myId) { this.myName = name; this.applyMyLabelStyle(); }
         else this.remoteShips.rename(id, name);
+      })
+      .on('team_set', ({ updates }) => {
+        for (const u of updates) {
+          if (u.id === this.myId) {
+            this.myTeamId = u.teamId;
+            this.remoteShips.setLocalTeam(u.teamId);   // restyle every teammate label
+            this.applyMyLabelStyle();
+          } else {
+            this.remoteShips.setTeam(u.id, u.teamId);
+          }
+        }
+      })
+      .on('team_invite', ({ fromId, fromName }) => {
+        this.invitePopup.show(fromId, fromName);
+        this.beginInviteFreeze();
+        this.sound.play('sfx_join', { volume: 0.4 });
       })
       .on('player_leave', ({ id }) => {
         this.remoteShips.remove(id);
@@ -388,10 +455,14 @@ export class GameScene extends Phaser.Scene {
   // ── Gameplay ───────────────────────────────────────────────────────────────
 
   private handleInput(): void {
-    const { left, right, up } = this.cursors;
+    const { left, right, up, down } = this.cursors;
     if (left.isDown)       this.ship.setAngularVelocity(-PLAYER_ROTATION_SPEED);
     else if (right.isDown) this.ship.setAngularVelocity(PLAYER_ROTATION_SPEED);
     else                   this.ship.setAngularVelocity(0);
+
+    // Brake: holding DOWN (without thrusting) swaps in a much stronger damping so
+    // the ship decelerates to a stop. Otherwise coast on the gentle default drag.
+    this.ship.setDrag(down.isDown && !up.isDown ? BRAKE_DRAG : SHIP_DRAG);
 
     // Boost: hold CTRL while thrusting to fly at BOOST_SPEED_MULT× thrust speed
     // until the gauge runs dry. Lift the velocity cap so the burst isn't clamped.
@@ -417,6 +488,8 @@ export class GameScene extends Phaser.Scene {
     const myRadius = COLLISION_RADIUS * shipScaleForLevel(this.myLevel);
     for (const [id, sprite] of this.remoteShips.entries()) {
       if (!sprite.visible) continue;
+      // A ship sheltering in a refuge can't be rammed.
+      if (inSafeZone(wrap(sprite.x, WORLD_WIDTH), wrap(sprite.y, WORLD_HEIGHT))) continue;
       const theirRadius = COLLISION_RADIUS * shipScaleForLevel(this.remoteShips.levelOf(id));
       if (Phaser.Math.Distance.Between(this.ship.x, this.ship.y, sprite.x, sprite.y) < myRadius + theirRadius) {
         this.applyKnockback(sprite.x, sprite.y, time);
@@ -453,11 +526,17 @@ export class GameScene extends Phaser.Scene {
   private applyKnockback(fromX: number, fromY: number, time: number): void {
     const away  = Math.atan2(this.ship.y - fromY, this.ship.x - fromX);
     const speed = KNOCKBACK_SPEED_MULT * PLAYER_SPEED;
+    this.ship.setDrag(SHIP_DRAG);      // clear any brake drag so the launch decays normally
     this.ship.setMaxVelocity(speed);   // lift the normal cap so the launch isn't clamped
     this.physics.velocityFromRotation(away, speed, this.ship.body!.velocity);
     this.ship.setAngularVelocity(Math.random() < 0.5 ? -KNOCKBACK_SPIN_DEG : KNOCKBACK_SPIN_DEG);
     this.stunnedUntil = time + KNOCKBACK_STUN_MS;
     this.sound.play('sfx_join', { volume: 0.2 });
+  }
+
+  /** Is the local ship currently inside a pole refuge? (torus-aware, wrapped coords) */
+  private inMySafeZone(): boolean {
+    return inSafeZone(wrap(this.ship.x, WORLD_WIDTH), wrap(this.ship.y, WORLD_HEIGHT));
   }
 
   /** End the stun: stop the spin and restore the normal speed cap. */
@@ -469,6 +548,7 @@ export class GameScene extends Phaser.Scene {
 
   /** Incoming bot laser confirmed contact (LaserSystem already checked guards). */
   private applyIncomingLaser(amount: number, shooterId: number | null): void {
+    if (this.inviteFreeze || this.inSafe) return;   // invincible while answering an invite / in a refuge
     if (this.consumeShield()) return;
     this.myHp = Math.max(0, this.myHp - amount);
     this.lastDamagedBy = shooterId;
@@ -494,7 +574,7 @@ export class GameScene extends Phaser.Scene {
   }
 
   private updateThruster(): void {
-    const isThrusting = !this.isDead && this.time.now >= this.stunnedUntil && this.cursors.up.isDown;
+    const isThrusting = !this.isDead && !this.inviteFreeze && this.time.now >= this.stunnedUntil && this.cursors.up.isDown;
     this.thruster.setVisible(isThrusting);
     if (!isThrusting) return;
     const s         = shipScaleForLevel(this.myLevel);
@@ -509,6 +589,30 @@ export class GameScene extends Phaser.Scene {
   private applyShipScale(): void {
     this.ship.setScale(shipSpriteScale(this.myLevel));
     this.thruster.setScale(0.55 * shipScaleForLevel(this.myLevel));
+  }
+
+  /** Teammates show their pseudo in green wrapped in stars (matches RemoteShips). */
+  private applyMyLabelStyle(): void {
+    const teamed = this.myTeamId !== 0;
+    this.myNameLabel
+      .setText(teamed ? `⭐ ${this.myName} ⭐` : this.myName)
+      .setColor(teamed ? '#33ff66' : '#ffee88');
+  }
+
+  /** A team invite arrived: freeze the ship and make it invincible while deciding. */
+  private beginInviteFreeze(): void {
+    this.inviteFreeze = true;
+    this.ship.setVelocity(0, 0).setAngularVelocity(0);
+  }
+
+  /** Invite resolved. Answering keeps a 2 s invuln grace; a timeout grants none. */
+  private endInviteFreeze(grace: boolean): void {
+    if (!this.inviteFreeze) return;
+    this.inviteFreeze = false;
+    if (grace) {
+      this.invincibleUntil = this.time.now + 2000;
+      startBlink(this, this.ship, 2000);
+    }
   }
 
   /** Clear the shared HP-bar Graphics, draw the local ship's bar + label, then remotes'. */
@@ -550,7 +654,7 @@ export class GameScene extends Phaser.Scene {
 
   /** Left-Shift: consume the held bonus and apply its effect. */
   private activateHeldBonus(): void {
-    if (this.isDead || !this.heldBonus) return;
+    if (this.isDead || this.inviteFreeze || !this.heldBonus) return;   // bonuses blocked while answering an invite
     const kind = this.heldBonus;
     this.heldBonus = null;
     const now = this.time.now;
@@ -598,6 +702,7 @@ export class GameScene extends Phaser.Scene {
     this.hud.setHeldBonus(this.heldBonus);
     const now = this.time.now;
     const parts: string[] = [];
+    if (this.inSafe)                 parts.push('⛨ REFUGE');
     if (this.shieldHits > 0)         parts.push(`SHIELD x${this.shieldHits}`);
     if (now < this.invincibleUntil)  parts.push(`INVUL ${Math.ceil((this.invincibleUntil - now) / 1000)}s`);
     if (this.lasers.isMega())        parts.push(`MEGA ${Math.ceil(this.lasers.megaRemainingMs() / 1000)}s`);

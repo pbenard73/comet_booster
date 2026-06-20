@@ -88,6 +88,22 @@ export function showShieldBlock(scene: Phaser.Scene, x: number, y: number, radiu
   });
 }
 
+/** A laser deflecting off a refuge force field: a cyan flash + expanding ripple. */
+export function showForceFieldHit(scene: Phaser.Scene, x: number, y: number): void {
+  const flash = scene.add.circle(x, y, 6, 0xaaffff, 0.9).setDepth(8);
+  scene.tweens.add({
+    targets: flash, scaleX: 2.5, scaleY: 2.5, alpha: 0,
+    duration: 160, ease: 'Power2.easeOut',
+    onComplete: () => flash.destroy(),
+  });
+  const ring = scene.add.circle(x, y, 10, 0x66f0ff, 0).setStrokeStyle(2, 0x99f8ff, 0.9).setDepth(8);
+  scene.tweens.add({
+    targets: ring, scaleX: 3, scaleY: 3, alpha: 0,
+    duration: 320, ease: 'Power2.easeOut',
+    onComplete: () => ring.destroy(),
+  });
+}
+
 /** "DESTROYED" overlay + 5-second respawn countdown; `onComplete` fires at zero. */
 export function showDeathOverlay(scene: Phaser.Scene, onComplete: () => void): void {
   const { width, height } = scene.scale;

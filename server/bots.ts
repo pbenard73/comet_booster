@@ -136,13 +136,13 @@ export function startBots(
     };
     bots.push(bot);
     botIds.add(id);
-    players.set(id, { id, x: bot.x, y: bot.y, angle: bot.angle, dead: false, level: bot.level, xp: 0, name: bot.name, ship: bot.ship });
+    players.set(id, { id, x: bot.x, y: bot.y, angle: bot.angle, dead: false, level: bot.level, xp: 0, name: bot.name, ship: bot.ship, teamId: 0, bot: true });
   }
 
   for (const bot of bots) {
     app.publish('all', JSON.stringify({
       type: 'player_join',
-      player: { id: bot.id, x: bot.x, y: bot.y, angle: bot.angle, level: bot.level, name: bot.name, ship: bot.ship },
+      player: { id: bot.id, x: bot.x, y: bot.y, angle: bot.angle, level: bot.level, name: bot.name, ship: bot.ship, bot: true },
     } as ServerMessage));
   }
 

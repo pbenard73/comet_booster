@@ -2,12 +2,12 @@ import uWS, { type WebSocket } from 'uWebSockets.js';
 import {
   PORT, WORLD_WIDTH, WORLD_HEIGHT, SHIP_COUNT,
   LASER_DAMAGE, XP_PER_HIT, XP_PER_KILL, XP_TO_LEVEL,
-  AOI_RADIUS, BOT_SHOOT_DAMAGE, MINIMAP_BOT_REFRESH_MS,
+  AOI_RADIUS, BOT_COUNT, BOT_SHOOT_DAMAGE, MINIMAP_BOT_REFRESH_MS,
   SERVER_TICK_MS, MAX_NEIGHBORS,
   LEADERBOARD_SIZE, LEADERBOARD_REFRESH_MS,
   BONUS_DROP_CHANCE, BONUS_TTL_MS, MAX_BONUSES, TELEPORT_GRID,
   BONUS_SIZE_PX, BONUS_PICKUP_PAD, COLLISION_RADIUS, BASE_SHIP_SCALE, SCALE_PER_LEVEL,
-  BONUS_INVINCIBLE_MS, BONUS_MEGA_MS, BONUS_SHIELD_VISUAL_MS,
+  BONUS_INVINCIBLE_MS, BONUS_MEGA_MS, BONUS_SHIELD_VISUAL_MS, inSafeZone, torusDelta,
 } from '../shared/constants.js';
 import { BONUS_KINDS } from '../shared/types.js';
 import type { ServerMessage, ClientMessage, LeaderboardEntry, BonusState, BonusType } from '../shared/types.js';
@@ -27,6 +27,9 @@ const grid     = new SpatialGrid();
 let botCtrl: BotController | null = null;
 let nextId = 1;
 let nextBonusId = 1;
+let nextTeamId = 1;
+// Pending team invites: invitee id → set of inviter ids awaiting their answer.
+const pendingInvites = new Map<number, Set<number>>();
 const allocateId = () => nextId++;
 const aoiSq = AOI_RADIUS * AOI_RADIUS;
 
@@ -41,6 +44,57 @@ function randomSpawn(): { x: number; y: number } {
 
 function sendDirect(playerId: number, msg: ServerMessage): void {
   sockets.get(playerId)?.send(JSON.stringify(msg));
+}
+
+// ── Teams ──────────────────────────────────────────────────────────────────
+// A team is a connected component of the "associate" graph: each member stores
+// the same teamId. Merging two players unions their components (transitive — if
+// J4 associates with J3 who is already in {J1,J2,J3}, J4 joins all of them).
+
+function broadcastTeamSet(ids: number[]): void {
+  if (ids.length === 0) return;
+  const updates = ids.map(id => ({ id, teamId: players.get(id)?.teamId ?? 0 }));
+  app.publish('all', JSON.stringify({ type: 'team_set', updates } as ServerMessage));
+}
+
+function mergeTeams(a: number, b: number): void {
+  const pa = players.get(a), pb = players.get(b);
+  if (!pa || !pb || a === b) return;
+  const ta = pa.teamId ?? 0, tb = pb.teamId ?? 0;
+  if (ta !== 0 && ta === tb) return;                       // already teammates
+  if (ta === 0 && tb === 0) {                              // both solo → brand-new team
+    const t = nextTeamId++;
+    pa.teamId = pb.teamId = t;
+    broadcastTeamSet([a, b]);
+  } else if (tb === 0) {                                   // b joins a's team
+    pb.teamId = ta;
+    broadcastTeamSet([b]);
+  } else if (ta === 0) {                                   // a joins b's team
+    pa.teamId = tb;
+    broadcastTeamSet([a]);
+  } else {                                                 // two teams → fold tb into ta
+    const changed: number[] = [];
+    for (const p of players.values()) {
+      if ((p.teamId ?? 0) === tb) { p.teamId = ta; changed.push(p.id); }
+    }
+    broadcastTeamSet(changed);
+  }
+}
+
+/** A member left: a team of one is no longer a team — dissolve it. */
+function dissolveIfSingleton(teamId: number): void {
+  if (teamId === 0) return;
+  const members = [...players.values()].filter(p => (p.teamId ?? 0) === teamId);
+  if (members.length === 1) {
+    members[0].teamId = 0;
+    broadcastTeamSet([members[0].id]);
+  }
+}
+
+/** Drop any pending invites referencing a departing player (as inviter or invitee). */
+function clearInvitesFor(id: number): void {
+  pendingInvites.delete(id);
+  for (const set of pendingInvites.values()) set.delete(id);
 }
 
 function awardXP(playerId: number, amount: number): void {
@@ -171,6 +225,24 @@ function lowestDensityPos(): { x: number; y: number } {
 
 const app = uWS.App();
 
+// Team search (HTTP — the start screen has no WebSocket). Returns online HUMAN
+// players (a socket exists; bots are excluded) whose name starts with `q`.
+app.get('/api/players', (res, req) => {
+  let aborted = false;
+  res.onAborted(() => { aborted = true; });
+  const q = sanitizeName(req.getQuery('q') ?? '').toLowerCase();
+  const results: Array<{ id: number; name: string }> = [];
+  if (q) {
+    for (const pid of sockets.keys()) {
+      const p = players.get(pid);
+      console.log(p?.name, q)
+      if (p && p.name.toLowerCase().startsWith(q)) results.push({ id: pid, name: p.name });
+      if (results.length >= 8) break;
+    }
+  }
+  if (!aborted) res.writeHeader('Content-Type', 'application/json').end(JSON.stringify(results));
+});
+
 // Static files (production only — dev uses Vite)
 app.get('/*', serveStatic);
 
@@ -187,7 +259,7 @@ app.ws<WsData>('/ws', {
     sockets.set(id, ws);
 
     const spawn = randomSpawn();
-    players.set(id, { id, ...spawn, angle: 0, dead: false, level: 1, xp: 0, name: `Pilot${id}`, ship: randomShip() });
+    players.set(id, { id, ...spawn, angle: 0, dead: false, level: 1, xp: 0, name: `Pilot${id}`, ship: randomShip(), teamId: 0 });
 
     const init: ServerMessage = { type: 'init', id, players: [...players.values()], bonuses: [...bonuses.values()] };
     ws.send(JSON.stringify(init));
@@ -229,14 +301,53 @@ app.ws<WsData>('/ws', {
         break;
       }
 
+      case 'team_invite_send': {
+        // Deliver a confirm prompt to the target's screen. Target must be a live
+        // human (not a bot, not self).
+        const me     = players.get(id);
+        const target = players.get(msg.toId);
+        if (!me || !target || msg.toId === id || !sockets.has(msg.toId)) break;
+        let set = pendingInvites.get(msg.toId);
+        if (!set) pendingInvites.set(msg.toId, (set = new Set()));
+        set.add(id);
+        sendDirect(msg.toId, { type: 'team_invite', fromId: id, fromName: me.name });
+        break;
+      }
+
+      case 'team_invite_respond': {
+        // Only honour an answer to an invite we actually recorded for this player.
+        const set = pendingInvites.get(id);
+        if (!set || !set.has(msg.fromId)) break;
+        set.delete(msg.fromId);
+        if (set.size === 0) pendingInvites.delete(id);
+        if (msg.accept) mergeTeams(msg.fromId, id);
+        break;
+      }
+
       case 'hit': {
         const shooter = players.get(id);
         const target  = players.get(msg.targetId);
         if (!shooter || shooter.dead || !target || target.dead) break;
+        // Pole refuge: a ship inside a safe zone takes no damage from outside.
+        if (inSafeZone(target.x, target.y)) break;
+        // No friendly fire: teammates (same non-zero teamId) can't damage each
+        // other, even in the window before a client's team_set arrives.
+        if ((shooter.teamId ?? 0) !== 0 && shooter.teamId === target.teamId) break;
         const hit: ServerMessage = { type: 'player_hit', id: msg.targetId, damage: LASER_DAMAGE, shooterId: id };
         app.publish('all', JSON.stringify(hit));
         awardXP(id, XP_PER_HIT);
         botCtrl?.damageBot(msg.targetId, LASER_DAMAGE, id);
+        break;
+      }
+
+      case 'fire': {
+        // Make a human's laser bolts visible to everyone (mirrors how bots fire).
+        // Visual only — damage is still resolved authoritatively via 'hit'.
+        const p = players.get(id);
+        if (!p || p.dead || !Array.isArray(msg.bolts)) break;
+        for (const b of msg.bolts.slice(0, 12)) {
+          app.publish('all', JSON.stringify({ type: 'laser_spawn', shooterId: id, x: b.x, y: b.y, vx: b.vx, vy: b.vy } as ServerMessage));
+        }
         break;
       }
 
@@ -310,8 +421,11 @@ app.ws<WsData>('/ws', {
 
   close(ws: WebSocket<WsData>) {
     const { id } = ws.getUserData();
+    const leavingTeam = players.get(id)?.teamId ?? 0;
     players.delete(id);
     sockets.delete(id);
+    clearInvitesFor(id);
+    dissolveIfSingleton(leavingTeam);
     app.publish('all', JSON.stringify({ type: 'player_leave', id } as ServerMessage));
     console.log(`[-] Player ${id} disconnected  (${players.size} online)`);
   },
@@ -326,7 +440,7 @@ app.listen(PORT, (token) => {
     if (process.env.NODE_ENV !== 'production') {
       // Killing a bot earns the shooter (bot or human) kill XP, so bot-vs-bot
       // fights move the leaderboard the same way human kills do.
-      botCtrl = startBots(app, players, allocateId, 250, (shooterId) => awardXP(shooterId, XP_PER_KILL), maybeDropBonus);
+      botCtrl = startBots(app, players, allocateId, BOT_COUNT, (shooterId) => awardXP(shooterId, XP_PER_KILL), maybeDropBonus);
     }
 
     // ── Unified authoritative tick (20 Hz, dev + prod) ──────────────────────
@@ -350,7 +464,9 @@ app.listen(PORT, (token) => {
         const near: Array<{ id: number; x: number; y: number; angle: number; d2: number }> = [];
         grid.forEachNear(me.x, me.y, 1, (o) => {
           if (o.id === socketId) return;
-          const dx = o.x - me.x, dy = o.y - me.y;
+          // Torus-shortest delta so a viewer at the seam (e.g. parked in a pole
+          // refuge at x=0) keeps ships just past the wrap in its AoI at 20 Hz.
+          const dx = torusDelta(o.x, me.x, WORLD_WIDTH), dy = torusDelta(o.y, me.y, WORLD_HEIGHT);
           const d2 = dx * dx + dy * dy;
           if (d2 <= aoiSq) {
             near.push({ id: o.id, x: Math.round(o.x), y: Math.round(o.y), angle: Math.round(o.angle), d2 });

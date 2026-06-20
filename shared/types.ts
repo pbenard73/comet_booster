@@ -7,6 +7,8 @@ export interface PlayerState {
   level:  number;
   ship:   number;   // index into the ship sprite pool (assigned by server, stable per player)
   name:   string;   // pseudo shown above the ship
+  teamId?: number;  // 0/undefined = no team; shared by all members of a connected team (see server mergeTeams)
+  bot?:   boolean;  // true for AI bots (dev only) — humans omit it. Lets clients suppress human-laser visuals.
 }
 
 // Power-up bonuses dropped by exploding ships. The kinds map 1:1 to the icons in
@@ -41,7 +43,9 @@ export type ServerMessage =
   | { type: 'bonus_remove';    id: number; pickerId: number }   // pickerId 0 = expired/no picker
   | { type: 'bonus_teleport';  id: number; x: number; y: number }
   | { type: 'player_effect';   id: number; kind: BonusType; ms: number }   // show a power-up effect on a ship
-  | { type: 'leaderboard';     top: LeaderboardEntry[]; rank: number; score: number; total: number };
+  | { type: 'leaderboard';     top: LeaderboardEntry[]; rank: number; score: number; total: number }
+  | { type: 'team_invite';     fromId: number; fromName: string }   // someone wants to team up → show confirm popup
+  | { type: 'team_set';        updates: Array<{ id: number; teamId: number }> };  // team membership changed (bulk)
 
 export interface LeaderboardEntry {
   name:  string;
@@ -55,8 +59,11 @@ export type ClientMessage =
   | { type: 'die';      killedBy?: number }
   | { type: 'respawn' }
   | { type: 'hit';      targetId: number }
+  | { type: 'fire';     bolts: Array<{ x: number; y: number; vx: number; vy: number }> }  // broadcast my laser bolts so others see them
   | { type: 'collide';  targetId: number }
   | { type: 'bonus_pickup'; id: number }   // request to claim a world bonus
   | { type: 'use_teleport' }               // teleport bonus activated (server picks the destination)
   | { type: 'notify_effect'; kind: BonusType; ms: number }  // I activated a bonus → broadcast it so others see it
+  | { type: 'team_invite_send';    toId: number }           // invite a player to team up (sent on spawn from the menu choice)
+  | { type: 'team_invite_respond'; fromId: number; accept: boolean }  // answer an invite
   | { type: 'set_name'; name: string };

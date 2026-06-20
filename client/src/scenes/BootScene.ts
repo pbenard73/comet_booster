@@ -37,6 +37,7 @@ export class BootScene extends Phaser.Scene {
     this.load.audio('sfx_laser', '/assets/audio/sfx_laser1.ogg');
     this.load.audio('sfx_join',  '/assets/audio/sfx_twoTone.ogg');
     this.load.audio('sfx_lose',  '/assets/audio/sfx_lose.ogg');
+    this.load.audio('sfx_deflect', '/assets/audio/sfx_laser2.ogg');  // "bong" — laser hitting a refuge force field
   }
 
   create(): void {
